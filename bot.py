@@ -91,7 +91,26 @@ class Database:
                     ticket_channel INTEGER, panel_id INTEGER, deleted_at TEXT,
                     created_at TEXT DEFAULT CURRENT_TIMESTAMP,
                     updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
-                    action_taken TEXT
+                    action_taken TEXT, player_id INTEGER
+                );
+                CREATE TABLE IF NOT EXISTS player_profiles (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    guild_id INTEGER NOT NULL,
+                    canonical_name TEXT NOT NULL,
+                    discord_id TEXT,
+                    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_player_profiles_discord_id
+                    ON player_profiles(guild_id, discord_id) WHERE discord_id IS NOT NULL AND discord_id != '';
+                CREATE TABLE IF NOT EXISTS player_aliases (
+                    guild_id INTEGER NOT NULL,
+                    player_id INTEGER NOT NULL,
+                    alias_normalized TEXT NOT NULL,
+                    alias_display TEXT NOT NULL,
+                    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY(guild_id, alias_normalized),
+                    FOREIGN KEY(player_id) REFERENCES player_profiles(id) ON DELETE CASCADE
                 );
                 CREATE TABLE IF NOT EXISTS evidence (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -196,6 +215,7 @@ class Database:
                 "ALTER TABLE report_panels ADD COLUMN delete_enabled INTEGER NOT NULL DEFAULT 1",
                 "ALTER TABLE reports ADD COLUMN panel_id INTEGER",
                 "ALTER TABLE reports ADD COLUMN action_taken TEXT",
+                "ALTER TABLE reports ADD COLUMN player_id INTEGER",
                 "ALTER TABLE report_panels ADD COLUMN form_title TEXT NOT NULL DEFAULT 'File a Discord Report'",
                 "ALTER TABLE report_panels ADD COLUMN username_label TEXT NOT NULL DEFAULT 'Discord Username'",
                 "ALTER TABLE report_panels ADD COLUMN username_description TEXT NOT NULL DEFAULT 'Enter the reported user name.'",
@@ -223,7 +243,9 @@ class Database:
                     await db.execute(statement)
                 except aiosqlite.OperationalError:
                     pass
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_reports_player_id ON reports(guild_id, player_id)")
             await db.commit()
+        await self.backfill_player_profiles()
 
     async def ensure_guild(self, guild_id: int) -> None:
         async with aiosqlite.connect(self.path) as db:
@@ -374,6 +396,114 @@ class Database:
             row = await cur.fetchone()
             return int(row[0] if row else 0)
 
+    @staticmethod
+    def _clean_discord_id(value: str) -> str:
+        digits = "".join(ch for ch in (value or "") if ch.isdigit())
+        return digits if len(digits) >= 15 else ""
+
+    async def resolve_player(self, guild_id: int, username: str, discord_id: str = "", create: bool = True):
+        """Resolve every panel submission to one database player profile.
+
+        Discord ID is the strongest key. Username aliases are secondary and normalized.
+        This avoids scanning Discord channels and works even after messages/channels are deleted.
+        """
+        alias = self.normalize_identity(username)
+        did = self._clean_discord_id(discord_id)
+        if not alias and not did:
+            return None
+        async with aiosqlite.connect(self.path) as conn:
+            conn.row_factory = aiosqlite.Row
+            profile = None
+            if did:
+                cur = await conn.execute(
+                    "SELECT * FROM player_profiles WHERE guild_id=? AND discord_id=?",
+                    (guild_id, did),
+                )
+                profile = await cur.fetchone()
+            alias_profile = None
+            if alias:
+                cur = await conn.execute(
+                    "SELECT p.* FROM player_aliases a JOIN player_profiles p ON p.id=a.player_id "
+                    "WHERE a.guild_id=? AND a.alias_normalized=?",
+                    (guild_id, alias),
+                )
+                alias_profile = await cur.fetchone()
+            if profile is None:
+                profile = alias_profile
+            elif alias_profile is not None and alias_profile["id"] != profile["id"]:
+                # A stable Discord ID proves both aliases belong to the same person.
+                old_id, keep_id = alias_profile["id"], profile["id"]
+                await conn.execute("UPDATE reports SET player_id=? WHERE guild_id=? AND player_id=?", (keep_id, guild_id, old_id))
+                await conn.execute("UPDATE OR IGNORE player_aliases SET player_id=? WHERE guild_id=? AND player_id=?", (keep_id, guild_id, old_id))
+                await conn.execute("DELETE FROM player_aliases WHERE guild_id=? AND player_id=?", (guild_id, old_id))
+                await conn.execute("DELETE FROM player_profiles WHERE guild_id=? AND id=?", (guild_id, old_id))
+            if profile is None and create:
+                display = (username or did or "Unknown Player").strip()[:100]
+                cur = await conn.execute(
+                    "INSERT INTO player_profiles(guild_id,canonical_name,discord_id) VALUES(?,?,?)",
+                    (guild_id, display, did or None),
+                )
+                player_id = cur.lastrowid
+            elif profile is not None:
+                player_id = profile["id"]
+                updates=[]; params=[]
+                if username and username.strip():
+                    updates.append("canonical_name=?"); params.append(username.strip()[:100])
+                if did:
+                    updates.append("discord_id=?"); params.append(did)
+                if updates:
+                    params.extend([guild_id, player_id])
+                    await conn.execute(
+                        f"UPDATE player_profiles SET {','.join(updates)},updated_at=CURRENT_TIMESTAMP WHERE guild_id=? AND id=?",
+                        params,
+                    )
+            else:
+                return None
+            aliases=[]
+            if alias:
+                aliases.append((alias, (username or alias)[:100]))
+            if did:
+                aliases.append((did, did))
+            for normalized, display in aliases:
+                await conn.execute(
+                    "INSERT INTO player_aliases(guild_id,player_id,alias_normalized,alias_display) VALUES(?,?,?,?) "
+                    "ON CONFLICT(guild_id,alias_normalized) DO UPDATE SET player_id=excluded.player_id,alias_display=excluded.alias_display",
+                    (guild_id, player_id, normalized, display),
+                )
+            await conn.commit()
+            cur = await conn.execute("SELECT * FROM player_profiles WHERE id=?", (player_id,))
+            return await cur.fetchone()
+
+    async def backfill_player_profiles(self) -> None:
+        async with aiosqlite.connect(self.path) as conn:
+            conn.row_factory = aiosqlite.Row
+            cur = await conn.execute(
+                "SELECT id,guild_id,target_name,discord_id FROM reports WHERE player_id IS NULL ORDER BY id"
+            )
+            rows = await cur.fetchall()
+        for row in rows:
+            profile = await self.resolve_player(row["guild_id"], row["target_name"], row["discord_id"] or "", True)
+            if profile:
+                async with aiosqlite.connect(self.path) as conn:
+                    await conn.execute("UPDATE reports SET player_id=? WHERE id=?", (profile["id"], row["id"]))
+                    await conn.commit()
+
+    async def add_player_alias(self, guild_id: int, existing_identity: str, alias: str) -> bool:
+        profile = await self.resolve_player(guild_id, existing_identity, existing_identity, False)
+        if not profile:
+            profile = await self.resolve_player(guild_id, existing_identity, "", False)
+        normalized = self.normalize_identity(alias)
+        if not profile or not normalized:
+            return False
+        async with aiosqlite.connect(self.path) as conn:
+            await conn.execute(
+                "INSERT INTO player_aliases(guild_id,player_id,alias_normalized,alias_display) VALUES(?,?,?,?) "
+                "ON CONFLICT(guild_id,alias_normalized) DO UPDATE SET player_id=excluded.player_id,alias_display=excluded.alias_display",
+                (guild_id, profile["id"], normalized, alias[:100]),
+            )
+            await conn.commit()
+        return True
+
     async def count_reports_for_target(self, guild_id: int, target_name: str) -> int:
         async with aiosqlite.connect(self.path) as db:
             cur = await db.execute(
@@ -397,10 +527,11 @@ class Database:
             await db.commit(); return cur.lastrowid
 
     async def add_report(self, guild_id: int, reporter_id: int, username: str, discord_id: str, rules: str, context: str, panel_id: int) -> int:
+        profile = await self.resolve_player(guild_id, username, discord_id, True)
         async with aiosqlite.connect(self.path) as db:
             cur = await db.execute(
-                "INSERT INTO reports(guild_id,reporter_id,target_name,discord_id,category,details,incident_context,panel_id) VALUES(?,?,?,?,?,?,?,?)",
-                (guild_id, reporter_id, username, discord_id, rules, context, "", panel_id),
+                "INSERT INTO reports(guild_id,reporter_id,target_name,discord_id,category,details,incident_context,panel_id,player_id) VALUES(?,?,?,?,?,?,?,?,?)",
+                (guild_id, reporter_id, username, discord_id, rules, context, "", panel_id, profile["id"] if profile else None),
             )
             await db.commit()
             return cur.lastrowid
@@ -538,31 +669,35 @@ class Database:
         return "".join(ch for ch in value if ch.isalnum() or ch in {".", "-"})
 
     async def person_history(self, guild_id: int, target: str):
-        wanted = self.normalize_identity(target)
-        async with aiosqlite.connect(self.path) as db:
-            db.row_factory = aiosqlite.Row
-            # Read every report in the guild. This intentionally ignores panel/channel/category
-            # boundaries so one player history combines all report destinations.
-            cur = await db.execute(
-                "SELECT * FROM reports WHERE guild_id=? ORDER BY id DESC",
-                (guild_id,),
-            )
-            all_reports = await cur.fetchall()
-            reports = [
-                row for row in all_reports
-                if self.normalize_identity(row["target_name"]) == wanted
-                or self.normalize_identity(row["discord_id"] or "") == wanted
-            ]
-            report_ids = [row["id"] for row in reports]
-            evidence = {}
-            if report_ids:
-                marks = ",".join("?" for _ in report_ids)
-                cur = await db.execute(
-                    f"SELECT * FROM evidence WHERE report_id IN ({marks}) ORDER BY id", report_ids
+        profile = await self.resolve_player(guild_id, target, target, False)
+        async with aiosqlite.connect(self.path) as conn:
+            conn.row_factory = aiosqlite.Row
+            if profile:
+                cur = await conn.execute(
+                    "SELECT * FROM reports WHERE guild_id=? AND player_id=? ORDER BY id DESC",
+                    (guild_id, profile["id"]),
                 )
-                for row in await cur.fetchall():
-                    evidence.setdefault(row["report_id"], []).append(row)
-            return reports, evidence
+            else:
+                # Compatibility fallback for records not yet migrated.
+                wanted = self.normalize_identity(target)
+                cur = await conn.execute("SELECT * FROM reports WHERE guild_id=? ORDER BY id DESC", (guild_id,))
+                rows = await cur.fetchall()
+                reports = [r for r in rows if self.normalize_identity(r["target_name"]) == wanted or self.normalize_identity(r["discord_id"] or "") == wanted]
+                report_ids = [r["id"] for r in reports]
+                evidence={}
+                if report_ids:
+                    marks=",".join("?" for _ in report_ids)
+                    cur=await conn.execute(f"SELECT * FROM evidence WHERE report_id IN ({marks}) ORDER BY id", report_ids)
+                    for item in await cur.fetchall(): evidence.setdefault(item["report_id"],[]).append(item)
+                return profile, reports, evidence
+            reports = await cur.fetchall()
+            report_ids=[r["id"] for r in reports]
+            evidence={}
+            if report_ids:
+                marks=",".join("?" for _ in report_ids)
+                cur=await conn.execute(f"SELECT * FROM evidence WHERE report_id IN ({marks}) ORDER BY id", report_ids)
+                for item in await cur.fetchall(): evidence.setdefault(item["report_id"],[]).append(item)
+            return profile, reports, evidence
 
     async def case_totals_for_identity(self, guild_id: int, target: str):
         wanted = self.normalize_identity(target)
@@ -1785,11 +1920,11 @@ async def tracker_summary(interaction: discord.Interaction):
 
 
 @track.command(name="person", description="Show a player's report actions, rules, and evidence")
-@app_commands.describe(username="Reported username or Discord ID from any report channel/category")
+@app_commands.describe(username="Tracked username, known alias, or Discord ID")
 @app_commands.checks.has_permissions(moderate_members=True)
 async def track_person(interaction: discord.Interaction, username: str):
     await interaction.response.defer(ephemeral=True, thinking=True)
-    reports, evidence_map = await db.person_history(interaction.guild_id, username)
+    profile, reports, evidence_map = await db.person_history(interaction.guild_id, username)
     case_totals = await db.case_totals_for_identity(interaction.guild_id, username)
     report_actions = {"warn":0, "kick":0, "timeout":0, "ban":0}
     for row in reports:
@@ -1797,8 +1932,11 @@ async def track_person(interaction: discord.Interaction, username: str):
         if action in report_actions:
             report_actions[action] += 1
     totals = {k: case_totals.get(k, 0) + report_actions[k] for k in report_actions}
-    embed = discord.Embed(title=f"Person Tracker • {username}", color=0x5865F2)
-    embed.add_field(name="Username", value=username, inline=False)
+    display_name = profile["canonical_name"] if profile else username
+    embed = discord.Embed(title=f"Person Tracker • {display_name}", color=0x5865F2)
+    embed.add_field(name="Username", value=display_name, inline=False)
+    if profile and profile["discord_id"]:
+        embed.add_field(name="Discord ID", value=profile["discord_id"], inline=False)
     embed.add_field(name="Warn Count", value=str(totals["warn"]))
     embed.add_field(name="Kick Count", value=str(totals["kick"]))
     embed.add_field(name="Ban Count", value=str(totals["ban"]))
@@ -1847,8 +1985,18 @@ async def track_person(interaction: discord.Interaction, username: str):
         value=("\n\n".join(history) or "No matching reports found.")[:1024],
         inline=False,
     )
-    embed.set_footer(text="Combines matching submissions from every report panel, channel, and category in this server. Use /report set-action after staff decides the action.")
+    embed.set_footer(text="Database-first tracker: every submission is linked to one player profile regardless of panel, channel, category, deleted message, or renamed channel. Use /report set-action after staff decides the action.")
     await interaction.followup.send(embed=embed, ephemeral=True)
+
+@track.command(name="add-alias", description="Link another username spelling to an existing tracked player")
+@app_commands.describe(existing="Existing tracked username or Discord ID", alias="Another spelling/name that belongs to the same player")
+@app_commands.checks.has_permissions(administrator=True)
+async def track_add_alias(interaction: discord.Interaction, existing: str, alias: str):
+    ok = await db.add_player_alias(interaction.guild_id, existing, alias)
+    await interaction.response.send_message(
+        f"Linked **{alias}** to **{existing}**." if ok else "Existing player was not found. Submit at least one report for that player first.",
+        ephemeral=True,
+    )
 
 @bot.tree.command(name="help", description="Show explanations and examples for every bot command")
 async def help_command(interaction: discord.Interaction):
