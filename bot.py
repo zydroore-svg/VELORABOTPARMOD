@@ -909,25 +909,40 @@ def build_ticket_embed(
 
 
 async def is_ticket_staff(member: discord.Member, panel_id: Optional[int] = None) -> bool:
-    # Administrators always retain access so the server cannot be locked out.
-    if member.guild_permissions.administrator:
+    """Return True when a member may claim/delete a report ticket.
+
+    Global and panel-specific staff roles are additive. Older builds treated a
+    panel role as an override, which accidentally blocked valid global staff.
+    """
+    guild = member.guild
+
+    # The server owner and administrators can never be locked out.
+    if member.id == guild.owner_id or member.guild_permissions.administrator:
         return True
 
-    member_role_ids = {role.id for role in member.roles}
+    member_role_ids = {int(role.id) for role in member.roles}
+    allowed_role_ids = {int(role_id) for role_id in await db.staff_role_ids(guild.id)}
 
-    # Panel-specific roles override the global staff-role list when configured.
-    if panel_id:
-        panel_roles = set(await db.panel_staff_role_ids(member.guild.id, panel_id))
-        if panel_roles:
-            return bool(member_role_ids & panel_roles)
+    if panel_id is not None:
+        allowed_role_ids.update(
+            int(role_id) for role_id in await db.panel_staff_role_ids(guild.id, int(panel_id))
+        )
 
-    global_roles = set(await db.staff_role_ids(member.guild.id))
-    if global_roles:
-        return bool(member_role_ids & global_roles)
+    # A member only needs one configured global OR panel-specific role.
+    if member_role_ids & allowed_role_ids:
+        return True
 
-    # Backward-compatible fallback until an administrator configures staff roles.
+    # Keep a safe permission fallback so existing moderator teams continue to
+    # work even before roles are configured or after a role was deleted.
     perms = member.guild_permissions
-    return perms.moderate_members or perms.manage_channels
+    return bool(
+        perms.manage_guild
+        or perms.moderate_members
+        or perms.kick_members
+        or perms.ban_members
+        or perms.manage_messages
+        or perms.manage_channels
+    )
 
 
 class TicketControlsView(discord.ui.View):
@@ -953,7 +968,7 @@ class TicketControlsView(discord.ui.View):
         if not row:
             return await interaction.response.send_message("This channel is not connected to a tracked report.", ephemeral=True)
         if not await is_ticket_staff(interaction.user, row["panel_id"]):
-            return await interaction.response.send_message("Only an administrator or a configured staff role can claim this ticket.", ephemeral=True)
+            return await interaction.response.send_message("You cannot claim this ticket. Ask an administrator to add your role with `/setup add-staff-role`, or authorize it for this panel.", ephemeral=True)
         if row["assigned_to"]:
             return await interaction.response.send_message(f"This ticket is already claimed by <@{row['assigned_to']}>.", ephemeral=True)
         claimed = await db.claim_report(interaction.guild_id, row["id"], interaction.user.id)
@@ -984,7 +999,7 @@ class TicketControlsView(discord.ui.View):
         if not row:
             return await interaction.response.send_message("This channel is not connected to a tracked report.", ephemeral=True)
         if not await is_ticket_staff(interaction.user, row["panel_id"]):
-            return await interaction.response.send_message("Only an administrator or a configured staff role can delete this ticket.", ephemeral=True)
+            return await interaction.response.send_message("You cannot delete this ticket. Ask an administrator to add your role with `/setup add-staff-role`, or authorize it for this panel.", ephemeral=True)
         await db.delete_report_ticket(interaction.guild_id, row["id"], interaction.user.id)
         await interaction.response.send_message(
             f"Report **#{row['id']}** will be deleted in 5 seconds. Its tracker record will remain saved.",
