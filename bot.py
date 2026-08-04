@@ -528,14 +528,31 @@ class Database:
             await db.commit()
             return cur.rowcount > 0
 
+    @staticmethod
+    def normalize_identity(value: str) -> str:
+        value = (value or "").strip().casefold()
+        # Accept mentions, @names, spaces, underscores and common display-name punctuation.
+        if value.startswith("<@") and value.endswith(">"):
+            value = value[2:-1].lstrip("!")
+        value = value.lstrip("@").replace(" ", "").replace("_", "")
+        return "".join(ch for ch in value if ch.isalnum() or ch in {".", "-"})
+
     async def person_history(self, guild_id: int, target: str):
+        wanted = self.normalize_identity(target)
         async with aiosqlite.connect(self.path) as db:
             db.row_factory = aiosqlite.Row
+            # Read every report in the guild. This intentionally ignores panel/channel/category
+            # boundaries so one player history combines all report destinations.
             cur = await db.execute(
-                "SELECT * FROM reports WHERE guild_id=? AND LOWER(TRIM(target_name))=LOWER(TRIM(?)) ORDER BY id DESC",
-                (guild_id, target),
+                "SELECT * FROM reports WHERE guild_id=? ORDER BY id DESC",
+                (guild_id,),
             )
-            reports = await cur.fetchall()
+            all_reports = await cur.fetchall()
+            reports = [
+                row for row in all_reports
+                if self.normalize_identity(row["target_name"]) == wanted
+                or self.normalize_identity(row["discord_id"] or "") == wanted
+            ]
             report_ids = [row["id"] for row in reports]
             evidence = {}
             if report_ids:
@@ -546,6 +563,20 @@ class Database:
                 for row in await cur.fetchall():
                     evidence.setdefault(row["report_id"], []).append(row)
             return reports, evidence
+
+    async def case_totals_for_identity(self, guild_id: int, target: str):
+        wanted = self.normalize_identity(target)
+        totals = {"warn": 0, "kick": 0, "timeout": 0, "ban": 0}
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute("SELECT type,target_name,target_id FROM cases WHERE guild_id=?", (guild_id,))
+            for row in await cur.fetchall():
+                candidates = [row["target_name"] or "", str(row["target_id"] or "")]
+                if any(self.normalize_identity(v) == wanted for v in candidates):
+                    kind = (row["type"] or "").lower()
+                    if kind in totals:
+                        totals[kind] += 1
+        return totals
 
     async def player_report_counts(self, guild_id: int, target: str):
         async with aiosqlite.connect(self.path) as db:
@@ -1754,13 +1785,12 @@ async def tracker_summary(interaction: discord.Interaction):
 
 
 @track.command(name="person", description="Show a player's report actions, rules, and evidence")
-@app_commands.describe(username="Exact reported username from the form")
+@app_commands.describe(username="Reported username or Discord ID from any report channel/category")
 @app_commands.checks.has_permissions(moderate_members=True)
 async def track_person(interaction: discord.Interaction, username: str):
     await interaction.response.defer(ephemeral=True, thinking=True)
     reports, evidence_map = await db.person_history(interaction.guild_id, username)
-    case_rows = await db.counts(interaction.guild_id, username)
-    case_totals = {row["type"]: row["total"] for row in case_rows}
+    case_totals = await db.case_totals_for_identity(interaction.guild_id, username)
     report_actions = {"warn":0, "kick":0, "timeout":0, "ban":0}
     for row in reports:
         action = (row["action_taken"] or "").lower()
@@ -1800,9 +1830,16 @@ async def track_person(interaction: discord.Interaction, username: str):
                 f"{row['log_channel']}/{row['log_message']}"
             )
         report_link = f"[Report #{row['id']}]({jump})" if jump else f"Report #{row['id']}"
+        source_channel = interaction.guild.get_channel(row["log_channel"]) if row["log_channel"] else None
+        if isinstance(source_channel, discord.TextChannel):
+            category_name = source_channel.category.name if source_channel.category else "No category"
+            source_text = f"{source_channel.mention} • {category_name}"
+        else:
+            source_text = "Saved database record (source channel unavailable)"
         history.append(
             f"**{report_link} — {action}**\n"
             f"Rule: {(row['category'] or 'Not supplied')[:180]}\n"
+            f"Source: {source_text}\n"
             f"{ev_links}"
         )
     embed.add_field(
@@ -1810,7 +1847,7 @@ async def track_person(interaction: discord.Interaction, username: str):
         value=("\n\n".join(history) or "No matching reports found.")[:1024],
         inline=False,
     )
-    embed.set_footer(text="Use /report set-action after staff decides Warn, Kick, Timeout, or Ban. Names are matched case-insensitively.")
+    embed.set_footer(text="Combines matching submissions from every report panel, channel, and category in this server. Use /report set-action after staff decides the action.")
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 @bot.tree.command(name="help", description="Show explanations and examples for every bot command")
