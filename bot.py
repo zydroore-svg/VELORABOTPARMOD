@@ -125,6 +125,21 @@ class Database:
                     position INTEGER NOT NULL,
                     FOREIGN KEY(report_id) REFERENCES reports(id) ON DELETE CASCADE
                 );
+                CREATE TABLE IF NOT EXISTS staff_roles (
+                    guild_id INTEGER NOT NULL,
+                    role_id INTEGER NOT NULL,
+                    added_by INTEGER NOT NULL,
+                    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY(guild_id, role_id)
+                );
+                CREATE TABLE IF NOT EXISTS panel_staff_roles (
+                    panel_id INTEGER NOT NULL,
+                    role_id INTEGER NOT NULL,
+                    added_by INTEGER NOT NULL,
+                    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY(panel_id, role_id),
+                    FOREIGN KEY(panel_id) REFERENCES report_panels(id) ON DELETE CASCADE
+                );
                 CREATE TABLE IF NOT EXISTS report_panels (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     guild_id INTEGER NOT NULL,
@@ -357,6 +372,15 @@ class Database:
             row = await cur.fetchone()
             return int(row[0] if row else 0)
 
+    async def count_reports_for_target(self, guild_id: int, target_name: str) -> int:
+        async with aiosqlite.connect(self.path) as db:
+            cur = await db.execute(
+                "SELECT COUNT(*) FROM reports WHERE guild_id=? AND LOWER(TRIM(target_name))=LOWER(TRIM(?))",
+                (guild_id, target_name),
+            )
+            row = await cur.fetchone()
+            return int(row[0] if row else 0)
+
     async def add_case_evidence(self, case_id: int, filename: str, content_type: Optional[str], size: int, url: str) -> None:
         async with aiosqlite.connect(self.path) as db:
             await db.execute(
@@ -418,6 +442,54 @@ class Database:
                 (guild_id, panel_id),
             )
             return await cur.fetchall()
+
+    async def add_staff_role(self, guild_id: int, role_id: int, added_by: int) -> None:
+        async with aiosqlite.connect(self.path) as conn:
+            await conn.execute(
+                "INSERT OR REPLACE INTO staff_roles(guild_id,role_id,added_by) VALUES(?,?,?)",
+                (guild_id, role_id, added_by),
+            )
+            await conn.commit()
+
+    async def remove_staff_role(self, guild_id: int, role_id: int) -> bool:
+        async with aiosqlite.connect(self.path) as conn:
+            cur = await conn.execute("DELETE FROM staff_roles WHERE guild_id=? AND role_id=?", (guild_id, role_id))
+            await conn.commit()
+            return cur.rowcount > 0
+
+    async def staff_role_ids(self, guild_id: int) -> list[int]:
+        async with aiosqlite.connect(self.path) as conn:
+            cur = await conn.execute("SELECT role_id FROM staff_roles WHERE guild_id=? ORDER BY role_id", (guild_id,))
+            return [int(row[0]) for row in await cur.fetchall()]
+
+    async def add_panel_staff_role(self, guild_id: int, panel_id: int, role_id: int, added_by: int) -> bool:
+        panel = await self.panel(guild_id, panel_id)
+        if not panel:
+            return False
+        async with aiosqlite.connect(self.path) as conn:
+            await conn.execute(
+                "INSERT OR REPLACE INTO panel_staff_roles(panel_id,role_id,added_by) VALUES(?,?,?)",
+                (panel_id, role_id, added_by),
+            )
+            await conn.commit()
+            return True
+
+    async def remove_panel_staff_role(self, guild_id: int, panel_id: int, role_id: int) -> bool:
+        panel = await self.panel(guild_id, panel_id)
+        if not panel:
+            return False
+        async with aiosqlite.connect(self.path) as conn:
+            cur = await conn.execute("DELETE FROM panel_staff_roles WHERE panel_id=? AND role_id=?", (panel_id, role_id))
+            await conn.commit()
+            return cur.rowcount > 0
+
+    async def panel_staff_role_ids(self, guild_id: int, panel_id: int) -> list[int]:
+        panel = await self.panel(guild_id, panel_id)
+        if not panel:
+            return []
+        async with aiosqlite.connect(self.path) as conn:
+            cur = await conn.execute("SELECT role_id FROM panel_staff_roles WHERE panel_id=? ORDER BY role_id", (panel_id,))
+            return [int(row[0]) for row in await cur.fetchall()]
 
     async def claim_report(self, guild_id: int, report_id: int, staff_id: int) -> bool:
         async with aiosqlite.connect(self.path) as db:
@@ -563,6 +635,32 @@ class ReportModal(discord.ui.Modal):
                 await conn.execute("INSERT INTO evidence(report_id,filename,content_type,size,url) VALUES(?,?,?,?,?)", (report_id,uploaded.filename,original.content_type,uploaded.size,uploaded.url))
                 await conn.commit()
         await db.set_report_message(report_id, submission_channel.id, message.id)
+
+        # Alert staff when the reported-player username reaches two submitted reports.
+        reported_username = role_values["username"].strip()
+        if reported_username and reported_username != "Not supplied":
+            report_count = await db.count_reports_for_target(interaction.guild_id, reported_username)
+            if report_count == 2:
+                settings = await db.settings(interaction.guild_id)
+                alert_channel_id = settings["warn_alert_channel"]
+                alert_channel = interaction.guild.get_channel(alert_channel_id) if alert_channel_id else None
+                if isinstance(alert_channel, discord.TextChannel):
+                    alert = discord.Embed(
+                        title="⚠️ Repeat Player Report Alert",
+                        description=(
+                            f"**{reported_username}** has now appeared as the reported player in **2 submitted reports**. "
+                            "Staff should review both reports before deciding on further action."
+                        ),
+                        color=0xE74C3C,
+                        timestamp=discord.utils.utcnow(),
+                    )
+                    alert.add_field(name="Latest report", value=f"[Report #{report_id}]({message.jump_url})", inline=True)
+                    alert.add_field(name="Total reports", value=str(report_count), inline=True)
+                    alert.add_field(name="Submitted by", value=interaction.user.mention, inline=True)
+                    alert.add_field(name="Source panel", value=f"Panel #{self.panel_id}", inline=True)
+                    alert.set_footer(text="Reported-player names are matched without case sensitivity and surrounding spaces.")
+                    await alert_channel.send(embed=alert)
+
         await interaction.followup.send(f"Your report was submitted successfully. Tracking number: **#{report_id}**", ephemeral=True)
 
 
@@ -607,9 +705,26 @@ def build_ticket_embed(
     return embed
 
 
-def is_ticket_staff(member: discord.Member) -> bool:
+async def is_ticket_staff(member: discord.Member, panel_id: Optional[int] = None) -> bool:
+    # Administrators always retain access so the server cannot be locked out.
+    if member.guild_permissions.administrator:
+        return True
+
+    member_role_ids = {role.id for role in member.roles}
+
+    # Panel-specific roles override the global staff-role list when configured.
+    if panel_id:
+        panel_roles = set(await db.panel_staff_role_ids(member.guild.id, panel_id))
+        if panel_roles:
+            return bool(member_role_ids & panel_roles)
+
+    global_roles = set(await db.staff_role_ids(member.guild.id))
+    if global_roles:
+        return bool(member_role_ids & global_roles)
+
+    # Backward-compatible fallback until an administrator configures staff roles.
     perms = member.guild_permissions
-    return perms.administrator or perms.moderate_members or perms.manage_channels
+    return perms.moderate_members or perms.manage_channels
 
 
 class TicketControlsView(discord.ui.View):
@@ -629,11 +744,13 @@ class TicketControlsView(discord.ui.View):
         custom_id="report_ticket:claim:v1"
     )
     async def claim(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not interaction.guild or not isinstance(interaction.user, discord.Member) or not is_ticket_staff(interaction.user):
-            return await interaction.response.send_message("Only authorized staff can claim tickets.", ephemeral=True)
+        if not interaction.guild or not isinstance(interaction.user, discord.Member):
+            return await interaction.response.send_message("This button can only be used inside a server.", ephemeral=True)
         row = await db.report_by_message(interaction.guild_id, interaction.channel_id, interaction.message.id)
         if not row:
             return await interaction.response.send_message("This channel is not connected to a tracked report.", ephemeral=True)
+        if not await is_ticket_staff(interaction.user, row["panel_id"]):
+            return await interaction.response.send_message("Only an administrator or a configured staff role can claim this ticket.", ephemeral=True)
         if row["assigned_to"]:
             return await interaction.response.send_message(f"This ticket is already claimed by <@{row['assigned_to']}>.", ephemeral=True)
         claimed = await db.claim_report(interaction.guild_id, row["id"], interaction.user.id)
@@ -658,11 +775,13 @@ class TicketControlsView(discord.ui.View):
         custom_id="report_ticket:delete:v1"
     )
     async def delete(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not interaction.guild or not isinstance(interaction.user, discord.Member) or not is_ticket_staff(interaction.user):
-            return await interaction.response.send_message("Only authorized staff can delete tickets.", ephemeral=True)
+        if not interaction.guild or not isinstance(interaction.user, discord.Member):
+            return await interaction.response.send_message("This button can only be used inside a server.", ephemeral=True)
         row = await db.report_by_message(interaction.guild_id, interaction.channel_id, interaction.message.id)
         if not row:
             return await interaction.response.send_message("This channel is not connected to a tracked report.", ephemeral=True)
+        if not await is_ticket_staff(interaction.user, row["panel_id"]):
+            return await interaction.response.send_message("Only an administrator or a configured staff role can delete this ticket.", ephemeral=True)
         await db.delete_report_ticket(interaction.guild_id, row["id"], interaction.user.id)
         await interaction.response.send_message(
             f"Report **#{row['id']}** will be deleted in 5 seconds. Its tracker record will remain saved.",
@@ -990,13 +1109,125 @@ async def setup_logs(interaction: discord.Interaction):
     await interaction.followup.send("The warning log and private report ticket system are configured.", ephemeral=True)
 
 
-@setup.command(name="warn-alert", description="Choose where the second-warning alert is sent")
-@app_commands.describe(channel="Private staff channel that receives repeat-warning alerts")
+@setup.command(name="report-alert", description="Choose where duplicate-player report alerts are sent")
+@app_commands.describe(channel="Private staff channel that receives alerts when a reported username reaches two reports")
 @app_commands.checks.has_permissions(administrator=True)
-async def setup_warn_alert(interaction: discord.Interaction, channel: discord.TextChannel):
+async def setup_report_alert(interaction: discord.Interaction, channel: discord.TextChannel):
     await db.update_settings(interaction.guild_id, warn_alert_channel=channel.id)
     await interaction.response.send_message(
-        f"Repeat-warning alerts will be sent to {channel.mention}. The alert triggers when a player name reaches exactly **2 warns**.",
+        f"Repeat-report alerts will be sent to {channel.mention}. The bot counts the reported-player username from submitted forms and alerts when that name reaches exactly **2 reports**.",
+        ephemeral=True,
+    )
+
+
+
+@setup.command(name="add-staff-role", description="Allow a role to claim and delete report tickets")
+@app_commands.describe(role="Staff role to authorize for tickets")
+@app_commands.checks.has_permissions(administrator=True)
+async def setup_add_staff_role(interaction: discord.Interaction, role: discord.Role):
+    if role.is_default() or role.is_bot_managed():
+        return await interaction.response.send_message("Choose a normal server role, not @everyone or a bot-managed role.", ephemeral=True)
+    await db.add_staff_role(interaction.guild_id, role.id, interaction.user.id)
+    permission_updates = 0
+    for panel in await db.panels(interaction.guild_id):
+        channel = interaction.guild.get_channel(panel["submission_channel_id"] or 0)
+        if isinstance(channel, discord.TextChannel):
+            try:
+                await channel.set_permissions(role, view_channel=True, send_messages=True, read_message_history=True)
+                permission_updates += 1
+            except discord.Forbidden:
+                pass
+    await interaction.response.send_message(
+        f"{role.mention} can now claim and delete tickets for panels that do not have their own staff-role list. "
+        f"Channel access was updated for **{permission_updates}** submission channel(s).",
+        ephemeral=True,
+    )
+
+
+@setup.command(name="remove-staff-role", description="Remove a role from the global ticket staff list")
+@app_commands.describe(role="Staff role to remove")
+@app_commands.checks.has_permissions(administrator=True)
+async def setup_remove_staff_role(interaction: discord.Interaction, role: discord.Role):
+    removed = await db.remove_staff_role(interaction.guild_id, role.id)
+    await interaction.response.send_message(
+        f"{role.mention} was removed from the global ticket staff list." if removed else f"{role.mention} was not in the global ticket staff list.",
+        ephemeral=True,
+    )
+
+
+@setup.command(name="staff-roles", description="List globally authorized ticket staff roles")
+@app_commands.checks.has_permissions(administrator=True)
+async def setup_staff_roles(interaction: discord.Interaction):
+    role_ids = await db.staff_role_ids(interaction.guild_id)
+    if not role_ids:
+        return await interaction.response.send_message(
+            "No global staff roles are configured. Until you add one, members with Moderate Members or Manage Channels can use ticket controls.",
+            ephemeral=True,
+        )
+    lines = []
+    for role_id in role_ids:
+        role = interaction.guild.get_role(role_id)
+        lines.append(role.mention if role else f"Deleted role (`{role_id}`)")
+    await interaction.response.send_message("**Global ticket staff roles**\n" + "\n".join(lines), ephemeral=True)
+
+
+@report.command(name="add-panel-staff-role", description="Authorize a role for one report panel only")
+@app_commands.describe(panel_id="Panel ID from /report panels", role="Role allowed to claim and delete this panel's submissions")
+@app_commands.checks.has_permissions(administrator=True)
+async def report_add_panel_staff_role(interaction: discord.Interaction, panel_id: int, role: discord.Role):
+    if role.is_default() or role.is_bot_managed():
+        return await interaction.response.send_message("Choose a normal server role, not @everyone or a bot-managed role.", ephemeral=True)
+    added = await db.add_panel_staff_role(interaction.guild_id, panel_id, role.id, interaction.user.id)
+    if not added:
+        return await interaction.response.send_message("Panel not found.", ephemeral=True)
+    panel = await db.panel(interaction.guild_id, panel_id)
+    access_note = ""
+    channel = interaction.guild.get_channel(panel["submission_channel_id"] or 0)
+    if isinstance(channel, discord.TextChannel):
+        try:
+            await channel.set_permissions(role, view_channel=True, send_messages=True, read_message_history=True)
+            access_note = f" Access to {channel.mention} was also granted."
+        except discord.Forbidden:
+            access_note = " I could not change the submission-channel permissions; grant this role View Channel manually."
+    await interaction.response.send_message(
+        f"{role.mention} is now authorized for panel **#{panel_id}**. Panel-specific roles override the global staff-role list.{access_note}",
+        ephemeral=True,
+    )
+
+
+@report.command(name="remove-panel-staff-role", description="Remove an authorized role from one panel")
+@app_commands.describe(panel_id="Panel ID", role="Role to remove from this panel")
+@app_commands.checks.has_permissions(administrator=True)
+async def report_remove_panel_staff_role(interaction: discord.Interaction, panel_id: int, role: discord.Role):
+    panel = await db.panel(interaction.guild_id, panel_id)
+    if not panel:
+        return await interaction.response.send_message("Panel not found.", ephemeral=True)
+    removed = await db.remove_panel_staff_role(interaction.guild_id, panel_id, role.id)
+    await interaction.response.send_message(
+        f"{role.mention} was removed from panel **#{panel_id}**." if removed else f"{role.mention} was not assigned to panel **#{panel_id}**.",
+        ephemeral=True,
+    )
+
+
+@report.command(name="panel-staff-roles", description="List roles authorized for one report panel")
+@app_commands.describe(panel_id="Panel ID")
+@app_commands.checks.has_permissions(administrator=True)
+async def report_panel_staff_roles(interaction: discord.Interaction, panel_id: int):
+    panel = await db.panel(interaction.guild_id, panel_id)
+    if not panel:
+        return await interaction.response.send_message("Panel not found.", ephemeral=True)
+    role_ids = await db.panel_staff_role_ids(interaction.guild_id, panel_id)
+    if not role_ids:
+        return await interaction.response.send_message(
+            f"Panel **#{panel_id}** has no panel-specific staff roles, so it uses the global list from `/setup staff-roles`.",
+            ephemeral=True,
+        )
+    lines = []
+    for role_id in role_ids:
+        role = interaction.guild.get_role(role_id)
+        lines.append(role.mention if role else f"Deleted role (`{role_id}`)")
+    await interaction.response.send_message(
+        f"**Staff roles for panel #{panel_id} — {panel['name']}**\n" + "\n".join(lines),
         ephemeral=True,
     )
 
@@ -1063,28 +1294,6 @@ async def create_name_only_case(
         for attachment in attachments:
             await db.add_case_evidence(case_id, attachment.filename, attachment.content_type, attachment.size, attachment.url)
             stored_count += 1
-
-    # Send a repeat-warning alert exactly when this name reaches two warnings.
-    if kind == "warn":
-        warning_count = await db.count_cases_for_target(interaction.guild_id, "warn", display)
-        if warning_count == 2:
-            settings = await db.settings(interaction.guild_id)
-            alert_channel_id = settings["warn_alert_channel"] or settings["warn_channel"]
-            alert_channel = interaction.guild.get_channel(alert_channel_id) if alert_channel_id else None
-            if isinstance(alert_channel, discord.TextChannel):
-                alert = discord.Embed(
-                    title="⚠️ Repeat Warning Alert",
-                    description=(
-                        f"**{display}** has now reached **2 warning records**. "
-                        "Staff should review the player's warning history before taking further action."
-                    ),
-                    color=0xE74C3C,
-                )
-                alert.add_field(name="Latest case", value=f"#{case_id}")
-                alert.add_field(name="Total warnings", value="2")
-                alert.add_field(name="Logged by", value=interaction.user.mention)
-                alert.set_footer(text="Names are matched without case sensitivity.")
-                await alert_channel.send(embed=alert)
 
     suffix = f" Evidence files saved: **{stored_count}**." if stored_count else ""
     await interaction.followup.send(
@@ -1515,8 +1724,14 @@ async def help_command(interaction: discord.Interaction):
     setup_embed.description = (
         "**`/setup logs`** — **Administrator**\n"
         "Creates or connects the private warning log and report-ticket channels.\n\n"
-        "**`/setup warn-alert channel`** — **Administrator**\n"
+        "**`/setup report-alert channel`** — **Administrator**\n"
         "Chooses the staff channel that receives an alert when one player reaches exactly two warnings.\n\n"
+        "**`/setup add-staff-role role`** — **Administrator**\n"
+        "Allows a role to claim and delete tickets globally.\n\n"
+        "**`/setup remove-staff-role role`** — **Administrator**\n"
+        "Removes a role from the global ticket staff list.\n\n"
+        "**`/setup staff-roles`** — **Administrator**\n"
+        "Lists all globally authorized ticket roles.\n\n"
         "**`/warn target reason`** — **Moderator**\n"
         "Records a name-only warning. The target may be a Discord username, Roblox username, display name, ID, or mention. "
         "It does not punish a Discord account."
@@ -1531,6 +1746,9 @@ async def help_command(interaction: discord.Interaction):
         "**`/report move-panel panel_id channel`** — Moves one panel message to another channel without changing its submission destination.\n\n"
         "**`/report set-submission-channel panel_id channel`** — Changes where forms from one panel are delivered.\n\n"
         "**`/report set-ticket-controls`** — Turns Claim and Delete buttons on or off for one panel; it can also update active submissions.\n\n"
+        "**`/report add-panel-staff-role panel_id role`** — Adds an authorized role for one panel only.\n\n"
+        "**`/report remove-panel-staff-role panel_id role`** — Removes a panel-specific role.\n\n"
+        "**`/report panel-staff-roles panel_id`** — Lists roles authorized for that panel.\n\n"
         "**`/report delete-panel panel_id`** — Deletes the selected panel message and its saved panel configuration. Existing reports remain tracked."
     )
     panel_embed.set_footer(text="All commands in this section require Administrator permission.")
