@@ -1057,26 +1057,26 @@ class FormSlotModal(discord.ui.Modal):
 
 
 class FormLabelsModal(discord.ui.Modal):
+    """Edits only the modal title. Individual fields are managed as removable slots."""
     def __init__(self, panel):
-        super().__init__(title=f"Form Labels • Panel #{panel['id']}", timeout=600)
+        super().__init__(title=f"Form Title • Panel #{panel['id']}", timeout=600)
         self.panel_id = panel["id"]
-        self.form_title = discord.ui.TextInput(label="Form title", default=panel["form_title"], max_length=45)
-        self.username_label = discord.ui.TextInput(label="Username field label", default=panel["username_label"], max_length=45)
-        self.discord_id_label = discord.ui.TextInput(label="Discord ID field label", default=panel["discord_id_label"], max_length=45)
-        self.rules_label = discord.ui.TextInput(label="Rules field label", default=panel["rules_label"], max_length=45)
-        self.context_label = discord.ui.TextInput(label="Context field label", default=panel["context_label"], max_length=45)
-        for item in (self.form_title, self.username_label, self.discord_id_label, self.rules_label, self.context_label):
-            self.add_item(item)
+        self.form_title = discord.ui.TextInput(
+            label="Form title",
+            default=panel["form_title"],
+            description="This appears at the top of the report form.",
+            max_length=45,
+        )
+        self.add_item(self.form_title)
 
     async def on_submit(self, interaction: discord.Interaction):
         await db.update_panel(
-            interaction.guild_id, self.panel_id,
-            form_title=str(self.form_title.value), username_label=str(self.username_label.value),
-            discord_id_label=str(self.discord_id_label.value), rules_label=str(self.rules_label.value),
-            context_label=str(self.context_label.value),
+            interaction.guild_id,
+            self.panel_id,
+            form_title=str(self.form_title.value).strip()[:45],
         )
         await interaction.response.send_message(
-            f"Form labels for panel **#{self.panel_id}** were updated.", ephemeral=True
+            f"Form title for panel **#{self.panel_id}** was updated.", ephemeral=True
         )
 
 
@@ -1160,6 +1160,98 @@ class FormEvidenceModal(discord.ui.Modal, title="Edit Evidence Field"):
         await interaction.response.send_message(f"Evidence settings for panel **#{self.panel_id}** were updated.", ephemeral=True)
 
 
+class FormSlotSelect(discord.ui.Select):
+    def __init__(self, slots):
+        options = [
+            discord.SelectOption(
+                label=str(slot["label"])[:100],
+                value=str(slot["id"]),
+                description=(
+                    f"{slot['field_type'].title()} • "
+                    f"{'Required' if slot['required'] else 'Optional'} • {slot['role']}"
+                )[:100],
+            )
+            for slot in slots[:25]
+        ]
+        if not options:
+            options = [discord.SelectOption(label="No fields configured", value="none")]
+        super().__init__(
+            placeholder="Select a form field to edit or delete",
+            min_values=1,
+            max_values=1,
+            options=options,
+            disabled=not slots,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        view = self.view
+        if not isinstance(view, FormSlotManagerView):
+            return
+        if self.values and self.values[0] != "none":
+            view.selected_slot_id = int(self.values[0])
+            slot = await db.form_slot(view.panel_id, view.selected_slot_id)
+            if slot:
+                await interaction.response.send_message(
+                    f"Selected **#{slot['id']} — {slot['label']}**. Use **Edit Selected** or **Delete Selected** below.",
+                    ephemeral=True,
+                )
+                return
+        await interaction.response.defer()
+
+
+class FormSlotManagerView(discord.ui.View):
+    def __init__(self, panel_id: int, owner_id: int, slots):
+        super().__init__(timeout=600)
+        self.panel_id = panel_id
+        self.owner_id = owner_id
+        self.selected_slot_id = None
+        self.add_item(FormSlotSelect(slots))
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message(
+                "Only the administrator who opened this field manager can use it.", ephemeral=True
+            )
+            return False
+        return True
+
+    @discord.ui.button(label="Add Field", style=discord.ButtonStyle.success, emoji="➕", row=1)
+    async def add_field(self, interaction: discord.Interaction, button: discord.ui.Button):
+        panel = await db.panel(interaction.guild_id, self.panel_id)
+        if not panel:
+            return await interaction.response.send_message("Panel no longer exists.", ephemeral=True)
+        slots = await db.form_slots(panel)
+        maximum = 4 if panel["evidence_enabled"] else 5
+        if len(slots) >= maximum:
+            return await interaction.response.send_message(
+                f"No free field slot. This form supports {maximum} text fields with the current evidence setting.",
+                ephemeral=True,
+            )
+        await interaction.response.send_modal(FormSlotModal(self.panel_id))
+
+    @discord.ui.button(label="Edit Selected", style=discord.ButtonStyle.primary, emoji="✏️", row=1)
+    async def edit_selected(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not self.selected_slot_id:
+            return await interaction.response.send_message("Select a field first.", ephemeral=True)
+        slot = await db.form_slot(self.panel_id, self.selected_slot_id)
+        if not slot:
+            return await interaction.response.send_message("That field no longer exists. Reopen the manager.", ephemeral=True)
+        await interaction.response.send_modal(FormSlotModal(self.panel_id, slot))
+
+    @discord.ui.button(label="Delete Selected", style=discord.ButtonStyle.danger, emoji="🗑️", row=1)
+    async def delete_selected(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not self.selected_slot_id:
+            return await interaction.response.send_message("Select a field first.", ephemeral=True)
+        slot = await db.form_slot(self.panel_id, self.selected_slot_id)
+        if not slot:
+            return await interaction.response.send_message("That field no longer exists. Reopen the manager.", ephemeral=True)
+        await db.delete_form_slot(self.panel_id, self.selected_slot_id)
+        await interaction.response.send_message(
+            f"Deleted **{slot['label']}** from panel **#{self.panel_id}**. Reopen `/report edit-form` to refresh the list.",
+            ephemeral=True,
+        )
+
+
 class FormEditorView(discord.ui.View):
     def __init__(self, panel_id: int, owner_id: int):
         super().__init__(timeout=600)
@@ -1178,25 +1270,40 @@ class FormEditorView(discord.ui.View):
             await interaction.response.send_message("Panel no longer exists.", ephemeral=True)
         return panel
 
-    @discord.ui.button(label="Title & Field Names", style=discord.ButtonStyle.primary, emoji="✏️")
-    async def labels_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+    @discord.ui.button(label="Form Title", style=discord.ButtonStyle.primary, emoji="📝")
+    async def title_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         panel = await self.get_panel(interaction)
-        if panel: await interaction.response.send_modal(FormLabelsModal(panel))
+        if panel:
+            await interaction.response.send_modal(FormLabelsModal(panel))
 
-    @discord.ui.button(label="Descriptions", style=discord.ButtonStyle.secondary, emoji="📝")
-    async def descriptions_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+    @discord.ui.button(label="Manage Fields", style=discord.ButtonStyle.primary, emoji="🧩")
+    async def fields_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         panel = await self.get_panel(interaction)
-        if panel: await interaction.response.send_modal(FormDescriptionsModal(panel))
-
-    @discord.ui.button(label="Placeholders", style=discord.ButtonStyle.secondary, emoji="💬")
-    async def placeholders_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        panel = await self.get_panel(interaction)
-        if panel: await interaction.response.send_modal(FormPlaceholdersModal(panel))
+        if not panel:
+            return
+        slots = await db.form_slots(panel)
+        lines = [
+            f"`#{slot['id']}` **{slot['label']}** — {slot['field_type']} • "
+            f"{'Required' if slot['required'] else 'Optional'} • tracker `{slot['role']}`"
+            for slot in slots
+        ]
+        embed = discord.Embed(
+            title=f"Form Fields • Panel #{self.panel_id}",
+            description=("\n".join(lines) if lines else "No text fields configured."),
+            color=panel["color"],
+        )
+        embed.set_footer(text="Select a field, then edit or delete it. Deleting affects future submissions only.")
+        await interaction.response.send_message(
+            embed=embed,
+            view=FormSlotManagerView(self.panel_id, interaction.user.id, slots),
+            ephemeral=True,
+        )
 
     @discord.ui.button(label="Evidence", style=discord.ButtonStyle.success, emoji="📎")
     async def evidence_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         panel = await self.get_panel(interaction)
-        if panel: await interaction.response.send_modal(FormEvidenceModal(panel))
+        if panel:
+            await interaction.response.send_modal(FormEvidenceModal(panel))
 
 
 class PanelCustomizeModal(discord.ui.Modal):
@@ -1648,11 +1755,10 @@ async def report_edit_form(interaction: discord.Interaction, panel_id: int):
         title=f"Form Editor • Panel #{panel_id}",
         description=(
             f"Editing **{panel['name']}**. Use the buttons below to edit the exact form opened by this panel.\n\n"
-            "• **Title & Field Names** — modal title and labels\n"
-            "• **Descriptions** — small help text under labels\n"
-            "• **Placeholders** — faded examples inside text boxes\n"
+            "• **Form Title** — changes the title at the top of the form\n"
+            "• **Manage Fields** — add, select, edit, or delete any field, including Roblox/Discord ID\n"
             "• **Evidence** — upload label, help text, required setting, and limit\n\n"
-            "Use `/report form-slots`, `/report add-form-slot`, `/report edit-form-slot`, and `/report remove-form-slot` to manage fields."
+            "Every field is now an independent removable slot. Deleted fields disappear from future submissions only."
         ),
         color=panel["color"],
     )
@@ -1660,7 +1766,7 @@ async def report_edit_form(interaction: discord.Interaction, panel_id: int):
     await interaction.response.send_message(embed=embed, view=FormEditorView(panel_id, interaction.user.id), ephemeral=True)
 
 
-@report.command(name="edit-form-labels", description="Customize the form title and field labels for one panel")
+@report.command(name="edit-form-labels", description="Customize the report form title for one panel")
 @app_commands.checks.has_permissions(administrator=True)
 async def report_edit_form_labels(interaction: discord.Interaction, panel_id: int):
     panel = await db.panel(interaction.guild_id, panel_id)
