@@ -90,7 +90,8 @@ class Database:
                     staff_note TEXT, log_channel INTEGER, log_message INTEGER,
                     ticket_channel INTEGER, panel_id INTEGER, deleted_at TEXT,
                     created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+                    updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                    action_taken TEXT
                 );
                 CREATE TABLE IF NOT EXISTS evidence (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -194,6 +195,7 @@ class Database:
                 "ALTER TABLE report_panels ADD COLUMN claim_enabled INTEGER NOT NULL DEFAULT 1",
                 "ALTER TABLE report_panels ADD COLUMN delete_enabled INTEGER NOT NULL DEFAULT 1",
                 "ALTER TABLE reports ADD COLUMN panel_id INTEGER",
+                "ALTER TABLE reports ADD COLUMN action_taken TEXT",
                 "ALTER TABLE report_panels ADD COLUMN form_title TEXT NOT NULL DEFAULT 'File a Discord Report'",
                 "ALTER TABLE report_panels ADD COLUMN username_label TEXT NOT NULL DEFAULT 'Discord Username'",
                 "ALTER TABLE report_panels ADD COLUMN username_description TEXT NOT NULL DEFAULT 'Enter the reported user name.'",
@@ -512,6 +514,39 @@ class Database:
             await db.commit()
             return cur.rowcount > 0
 
+    async def set_report_action(self, guild_id: int, report_id: int, action: str) -> bool:
+        normalized = action.strip().lower().replace(" ", "_")
+        aliases = {"warning":"warn", "warned":"warn", "kicked":"kick", "banned":"ban", "time_out":"timeout", "timed_out":"timeout"}
+        normalized = aliases.get(normalized, normalized)
+        if normalized not in {"warn", "kick", "ban", "timeout", "none"}:
+            return False
+        async with aiosqlite.connect(self.path) as db:
+            cur = await db.execute(
+                "UPDATE reports SET action_taken=?,updated_at=CURRENT_TIMESTAMP WHERE guild_id=? AND id=?",
+                (None if normalized == "none" else normalized, guild_id, report_id),
+            )
+            await db.commit()
+            return cur.rowcount > 0
+
+    async def person_history(self, guild_id: int, target: str):
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                "SELECT * FROM reports WHERE guild_id=? AND LOWER(TRIM(target_name))=LOWER(TRIM(?)) ORDER BY id DESC",
+                (guild_id, target),
+            )
+            reports = await cur.fetchall()
+            report_ids = [row["id"] for row in reports]
+            evidence = {}
+            if report_ids:
+                marks = ",".join("?" for _ in report_ids)
+                cur = await db.execute(
+                    f"SELECT * FROM evidence WHERE report_id IN ({marks}) ORDER BY id", report_ids
+                )
+                for row in await cur.fetchall():
+                    evidence.setdefault(row["report_id"], []).append(row)
+            return reports, evidence
+
     async def player_report_counts(self, guild_id: int, target: str):
         async with aiosqlite.connect(self.path) as db:
             db.row_factory = aiosqlite.Row
@@ -602,7 +637,7 @@ class ReportModal(discord.ui.Modal):
         if not interaction.guild:
             return await interaction.response.send_message("Reports must be submitted in a server.", ephemeral=True)
         field_values = []
-        role_values = {"username":"Not supplied", "discord_id":"Not supplied", "rules":"Not supplied", "context":"Not supplied"}
+        role_values = {"username":"Not supplied", "discord_id":"Not supplied", "rules":"Not supplied", "context":"Not supplied", "action":"Not supplied"}
         for slot, component in self.slot_inputs:
             value = str(component.value or "").strip() or "Not supplied"
             field_values.append((slot["id"], slot["label"], value, slot["position"]))
@@ -618,6 +653,8 @@ class ReportModal(discord.ui.Modal):
         await interaction.response.defer(ephemeral=True, thinking=True)
         report_id = await db.add_report(interaction.guild_id, interaction.user.id, role_values["username"], discord_id, role_values["rules"], role_values["context"], self.panel_id)
         await db.save_report_field_values(report_id, field_values)
+        if role_values.get("action") not in (None, "", "Not supplied"):
+            await db.set_report_action(interaction.guild_id, report_id, role_values["action"])
         submission_channel = interaction.guild.get_channel(self.submission_channel_id)
         if not isinstance(submission_channel, discord.TextChannel):
             return await interaction.followup.send("This panel's submission channel no longer exists.", ephemeral=True)
@@ -838,7 +875,7 @@ class FormSlotModal(discord.ui.Modal):
         if field_type not in {"short","paragraph"}:
             return await interaction.response.send_message("Type must be SHORT or PARAGRAPH.", ephemeral=True)
         parts=str(self.settings_input.value).strip().lower().split(":",1)
-        if len(parts)!=2 or parts[0] not in {"yes","no","y","n"} or parts[1] not in {"custom","username","discord_id","rules","context"}:
+        if len(parts)!=2 or parts[0] not in {"yes","no","y","n"} or parts[1] not in {"custom","username","discord_id","rules","context","action"}:
             return await interaction.response.send_message("Use Required:Role, such as YES:custom or NO:username.", ephemeral=True)
         required=parts[0] in {"yes","y"}; role=parts[1]
         values=dict(label=str(self.label_input.value).strip()[:45], description=str(self.description_input.value).strip()[:100], placeholder=str(self.placeholder_input.value).strip()[:100], field_type=field_type, required=int(required), role=role)
@@ -1080,6 +1117,7 @@ bot = ReportBot()
 setup = app_commands.Group(name="setup", description="Configure bot log channels")
 report = app_commands.Group(name="report", description="Submit and manage reports")
 tracker = app_commands.Group(name="tracker", description="View moderation and report totals")
+track = app_commands.Group(name="track", description="View a person's complete moderation history")
 
 
 @setup.command(name="logs", description="Create or connect all private log channels")
@@ -1643,6 +1681,22 @@ async def report_panel(
         )
     )
 
+@report.command(name="set-action", description="Record the moderation action taken for a submitted report")
+@app_commands.choices(action=[
+    app_commands.Choice(name="Warn", value="warn"),
+    app_commands.Choice(name="Kick", value="kick"),
+    app_commands.Choice(name="Timeout", value="timeout"),
+    app_commands.Choice(name="Ban", value="ban"),
+    app_commands.Choice(name="None / Clear", value="none"),
+])
+@app_commands.checks.has_permissions(moderate_members=True)
+async def report_set_action(interaction: discord.Interaction, report_id: int, action: app_commands.Choice[str]):
+    ok = await db.set_report_action(interaction.guild_id, report_id, action.value)
+    await interaction.response.send_message(
+        f"Report **#{report_id}** action set to **{action.name}**." if ok else "Report not found.",
+        ephemeral=True,
+    )
+
 @report.command(name="view", description="View a tracked report")
 @app_commands.checks.has_permissions(moderate_members=True)
 async def report_view(interaction: discord.Interaction, report_id: int):
@@ -1698,6 +1752,66 @@ async def tracker_summary(interaction: discord.Interaction):
     await interaction.response.send_message(embed=e,ephemeral=True)
 
 
+
+@track.command(name="person", description="Show a player's report actions, rules, and evidence")
+@app_commands.describe(username="Exact reported username from the form")
+@app_commands.checks.has_permissions(moderate_members=True)
+async def track_person(interaction: discord.Interaction, username: str):
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    reports, evidence_map = await db.person_history(interaction.guild_id, username)
+    case_rows = await db.counts(interaction.guild_id, username)
+    case_totals = {row["type"]: row["total"] for row in case_rows}
+    report_actions = {"warn":0, "kick":0, "timeout":0, "ban":0}
+    for row in reports:
+        action = (row["action_taken"] or "").lower()
+        if action in report_actions:
+            report_actions[action] += 1
+    totals = {k: case_totals.get(k, 0) + report_actions[k] for k in report_actions}
+    embed = discord.Embed(title=f"Person Tracker • {username}", color=0x5865F2)
+    embed.add_field(name="Username", value=username, inline=False)
+    embed.add_field(name="Warn Count", value=str(totals["warn"]))
+    embed.add_field(name="Kick Count", value=str(totals["kick"]))
+    embed.add_field(name="Ban Count", value=str(totals["ban"]))
+    embed.add_field(name="Timeout Count", value=str(totals["timeout"]))
+    embed.add_field(name="Total Reports", value=str(len(reports)))
+    rules=[]
+    seen=set()
+    for row in reports:
+        rule=(row["category"] or "Not supplied").strip()
+        key=rule.casefold()
+        if key not in seen:
+            seen.add(key); rules.append(rule)
+    embed.add_field(
+        name="Rules Broken",
+        value=("\n".join(f"• {r}" for r in rules[:10]) or "None recorded")[:1024],
+        inline=False,
+    )
+    history = []
+    for row in reports[:10]:
+        action = (row["action_taken"] or "Pending / not assigned").replace("_", " ").title()
+        ev = evidence_map.get(row["id"], [])
+        ev_links = " ".join(
+            f"[Evidence {i + 1}]({item['url']})" for i, item in enumerate(ev[:3])
+        ) or "No evidence"
+        jump = ""
+        if row["log_channel"] and row["log_message"]:
+            jump = (
+                f"https://discord.com/channels/{interaction.guild_id}/"
+                f"{row['log_channel']}/{row['log_message']}"
+            )
+        report_link = f"[Report #{row['id']}]({jump})" if jump else f"Report #{row['id']}"
+        history.append(
+            f"**{report_link} — {action}**\n"
+            f"Rule: {(row['category'] or 'Not supplied')[:180]}\n"
+            f"{ev_links}"
+        )
+    embed.add_field(
+        name="Recent Reports & Evidence",
+        value=("\n\n".join(history) or "No matching reports found.")[:1024],
+        inline=False,
+    )
+    embed.set_footer(text="Use /report set-action after staff decides Warn, Kick, Timeout, or Ban. Names are matched case-insensitively.")
+    await interaction.followup.send(embed=embed, ephemeral=True)
 
 @bot.tree.command(name="help", description="Show explanations and examples for every bot command")
 async def help_command(interaction: discord.Interaction):
@@ -1773,8 +1887,10 @@ async def help_command(interaction: discord.Interaction):
     tracking_embed.description = (
         "**`/report view report_id`** — **Moderator**\n"
         "Displays one tracked report, including its status, target, reporter, details, and evidence.\n\n"
+        "**`/report set-action report_id action`** — Records whether the submitted report resulted in Warn, Kick, Timeout, or Ban.\n\n"
         "**`/report update report_id status note`** — **Moderator**\n"
         "Changes a report to Open, In Review, Resolved, or Rejected and optionally saves a staff note.\n\n"
+        "**`/track person username`** — Shows rules broken, Warn/Kick/Ban/Timeout counts, and evidence links.\n\n"
         "**`/tracker player username`** — **Moderator**\n"
         "Shows the named player's warning total and report history. Names are matched without case sensitivity.\n\n"
         "**`/tracker user username`** — **Moderator**\n"
@@ -1789,6 +1905,7 @@ async def help_command(interaction: discord.Interaction):
         await interaction.followup.send(embed=help_embed, ephemeral=True)
 
 bot.tree.add_command(setup); bot.tree.add_command(report); bot.tree.add_command(tracker)
+bot.tree.add_command(track)
 
 @bot.tree.error
 async def tree_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
