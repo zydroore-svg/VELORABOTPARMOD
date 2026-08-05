@@ -168,6 +168,7 @@ class Database:
                     submission_channel_id INTEGER,
                     claim_enabled INTEGER NOT NULL DEFAULT 1,
                     delete_enabled INTEGER NOT NULL DEFAULT 1,
+                    deny_enabled INTEGER NOT NULL DEFAULT 1,
                     form_title TEXT NOT NULL DEFAULT 'File a Discord Report',
                     username_label TEXT NOT NULL DEFAULT 'Discord Username',
                     username_description TEXT NOT NULL DEFAULT 'Enter the reported user name.',
@@ -213,6 +214,7 @@ class Database:
                 "ALTER TABLE report_panels ADD COLUMN submission_channel_id INTEGER",
                 "ALTER TABLE report_panels ADD COLUMN claim_enabled INTEGER NOT NULL DEFAULT 1",
                 "ALTER TABLE report_panels ADD COLUMN delete_enabled INTEGER NOT NULL DEFAULT 1",
+                "ALTER TABLE report_panels ADD COLUMN deny_enabled INTEGER NOT NULL DEFAULT 1",
                 "ALTER TABLE reports ADD COLUMN panel_id INTEGER",
                 "ALTER TABLE reports ADD COLUMN action_taken TEXT",
                 "ALTER TABLE reports ADD COLUMN player_id INTEGER",
@@ -645,6 +647,17 @@ class Database:
             await db.commit()
             return cur.rowcount > 0
 
+    async def deny_report(self, guild_id: int, report_id: int, staff_id: int, reason: str) -> bool:
+        note = f"Denied by {staff_id}: {reason}"
+        async with aiosqlite.connect(self.path) as db:
+            cur = await db.execute(
+                "UPDATE reports SET status='Rejected',assigned_to=?,staff_note=CASE WHEN staff_note IS NULL OR staff_note='' "
+                "THEN ? ELSE staff_note || char(10) || ? END,updated_at=CURRENT_TIMESTAMP WHERE guild_id=? AND id=?",
+                (staff_id, note, note, guild_id, report_id),
+            )
+            await db.commit()
+            return cur.rowcount > 0
+
     async def set_report_action(self, guild_id: int, report_id: int, action: str) -> bool:
         normalized = action.strip().lower().replace(" ", "_")
         aliases = {"warning":"warn", "warned":"warn", "kicked":"kick", "banned":"ban", "time_out":"timeout", "timed_out":"timeout"}
@@ -773,6 +786,7 @@ class ReportModal(discord.ui.Modal):
         self.bot = bot
         self.panel_id = panel["id"]
         self.submission_channel_id = panel["submission_channel_id"]
+        self.panel = panel
         self.claim_enabled = bool(panel["claim_enabled"])
         self.delete_enabled = bool(panel["delete_enabled"])
         self.slot_inputs = []
@@ -831,7 +845,7 @@ class ReportModal(discord.ui.Modal):
             except discord.HTTPException:
                 pass
         embed = build_dynamic_ticket_embed(report_id, interaction.user, field_values, len(files), "Open", None, self.claim_enabled, self.delete_enabled)
-        controls = TicketControlsView(self.bot, claim_enabled=self.claim_enabled, delete_enabled=self.delete_enabled)
+        controls = TicketControlsView(self.bot, claim_enabled=self.claim_enabled, delete_enabled=self.delete_enabled, deny_enabled=bool(self.panel["deny_enabled"]) if "deny_enabled" in self.panel.keys() else True)
         message = await submission_channel.send(content=f"New report submitted by {interaction.user.mention}.", embed=embed, files=files, view=controls if controls.children else None)
         for original, uploaded in zip(attachments, message.attachments):
             async with aiosqlite.connect(db.path) as conn:
@@ -877,7 +891,7 @@ def build_dynamic_ticket_embed(report_id, reporter, field_values, evidence_count
     embed.add_field(name="Claimed by", value=f"<@{assigned_to}>" if assigned_to else "Unclaimed")
     embed.add_field(name="Evidence", value=f"{evidence_count} file(s)")
     instructions=[]
-    if claim_enabled: instructions.append("Claim Ticket assigns the report to one staff member.")
+    if claim_enabled: instructions.append("Claim Ticket assigns the report to one staff member. Deny Report marks it Rejected with a staff reason.")
     if delete_enabled: instructions.append("Delete Ticket removes the message but preserves tracking data.")
     embed.set_footer(text=" ".join(instructions) if instructions else "This report has no claim or delete controls enabled.")
     return embed
@@ -901,7 +915,7 @@ def build_ticket_embed(
     embed.add_field(name="Evidence", value=f"{evidence_count} file(s)")
     instructions = []
     if claim_enabled:
-        instructions.append("Claim Ticket assigns the report to one staff member.")
+        instructions.append("Claim Ticket assigns the report to one staff member. Deny Report marks it Rejected with a staff reason.")
     if delete_enabled:
         instructions.append("Delete Ticket removes the submission message but preserves tracking data.")
     embed.set_footer(text=" ".join(instructions) if instructions else "This report panel has no claim or delete controls enabled.")
@@ -946,7 +960,7 @@ async def is_ticket_staff(member: discord.Member, panel_id: Optional[int] = None
 
 
 class TicketControlsView(discord.ui.View):
-    def __init__(self, bot: "ReportBot", claimed: bool = False, claim_enabled: bool = True, delete_enabled: bool = True):
+    def __init__(self, bot: "ReportBot", claimed: bool = False, claim_enabled: bool = True, delete_enabled: bool = True, deny_enabled: bool = True):
         super().__init__(timeout=None)
         self.bot = bot
         if not claim_enabled:
@@ -956,6 +970,8 @@ class TicketControlsView(discord.ui.View):
             self.claim.label = "Claimed"
         if not delete_enabled:
             self.remove_item(self.delete)
+        if not deny_enabled:
+            self.remove_item(self.deny)
 
     @discord.ui.button(
         label="Claim Ticket", style=discord.ButtonStyle.success, emoji="✋",
@@ -984,9 +1000,23 @@ class TicketControlsView(discord.ui.View):
         panel = await db.panel(interaction.guild_id, row["panel_id"]) if row["panel_id"] else None
         claim_enabled = bool(panel["claim_enabled"]) if panel else True
         delete_enabled = bool(panel["delete_enabled"]) if panel else True
-        controls = TicketControlsView(self.bot, claimed=True, claim_enabled=claim_enabled, delete_enabled=delete_enabled)
+        controls = TicketControlsView(self.bot, claimed=True, claim_enabled=claim_enabled, delete_enabled=delete_enabled, deny_enabled=bool(panel["deny_enabled"]) if panel else True)
         await interaction.response.edit_message(embed=embed, view=controls if controls.children else None)
         await interaction.followup.send(f"Ticket claimed by {interaction.user.mention}.")
+
+    @discord.ui.button(
+        label="Deny Report", style=discord.ButtonStyle.secondary, emoji="⛔",
+        custom_id="report_ticket:deny:v1"
+    )
+    async def deny(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.guild or not isinstance(interaction.user, discord.Member):
+            return await interaction.response.send_message("This button can only be used inside a server.", ephemeral=True)
+        row = await db.report_by_message(interaction.guild_id, interaction.channel_id, interaction.message.id)
+        if not row:
+            return await interaction.response.send_message("This message is not connected to a tracked report.", ephemeral=True)
+        if not await is_ticket_staff(interaction.user, row["panel_id"]):
+            return await interaction.response.send_message("Only an administrator or configured staff role can deny this report.", ephemeral=True)
+        await interaction.response.send_modal(DenyReportModal(self.bot, row["id"]))
 
     @discord.ui.button(
         label="Delete Ticket", style=discord.ButtonStyle.danger, emoji="🗑️",
@@ -1010,6 +1040,48 @@ class TicketControlsView(discord.ui.View):
             await interaction.message.delete()
         except discord.HTTPException:
             pass
+
+
+class DenyReportModal(discord.ui.Modal, title="Deny Report"):
+    def __init__(self, bot: "ReportBot", report_id: int):
+        super().__init__(timeout=600)
+        self.bot = bot
+        self.report_id = report_id
+        self.reason = discord.ui.TextInput(
+            label="Reason for denial",
+            style=discord.TextStyle.paragraph,
+            placeholder="Explain why this report is being denied.",
+            min_length=2,
+            max_length=1000,
+        )
+        self.add_item(self.reason)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        row = await db.report(interaction.guild_id, self.report_id)
+        if not row:
+            return await interaction.response.send_message("Report not found.", ephemeral=True)
+        if not isinstance(interaction.user, discord.Member) or not await is_ticket_staff(interaction.user, row["panel_id"]):
+            return await interaction.response.send_message("You are not authorized to deny this report.", ephemeral=True)
+        reason = str(self.reason.value).strip()
+        await db.deny_report(interaction.guild_id, self.report_id, interaction.user.id, reason)
+        message = interaction.message
+        embed = message.embeds[0] if message and message.embeds else discord.Embed(title=f"Report Ticket #{self.report_id}")
+        for index, field in enumerate(embed.fields):
+            if field.name == "Status":
+                embed.set_field_at(index, name="Status", value="Rejected", inline=field.inline)
+            elif field.name == "Claimed by":
+                embed.set_field_at(index, name="Claimed by", value=interaction.user.mention, inline=field.inline)
+        embed.add_field(name="Denial Reason", value=reason[:1024], inline=False)
+        embed.color = discord.Color.red()
+        panel = await db.panel(interaction.guild_id, row["panel_id"]) if row["panel_id"] else None
+        view = TicketControlsView(
+            self.bot, claimed=True,
+            claim_enabled=bool(panel["claim_enabled"]) if panel else True,
+            delete_enabled=bool(panel["delete_enabled"]) if panel else True,
+            deny_enabled=False,
+        )
+        await interaction.response.edit_message(embed=embed, view=view if view.children else None)
+        await interaction.followup.send(f"Report **#{self.report_id}** was denied.", ephemeral=True)
 
 
 class ReportPanelView(discord.ui.View):
@@ -1716,16 +1788,37 @@ async def report_form_slots(interaction: discord.Interaction, panel_id: int):
     embed.set_footer(text=f"Evidence slot: {'ON' if evidence_on else 'OFF'} • Used rows: {len(slots)+(1 if evidence_on else 0)}/5")
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
-@report.command(name="add-form-slot", description="Add another field to one panel's report form")
+@report.command(name="add-form-slot", description="Add a new field directly to one panel form")
+@app_commands.describe(
+    panel_id="Panel ID from /report panels", label="Field label",
+    field_type="short or paragraph", required="Whether the field is required",
+    tracker_role="custom, username, discord_id, rules, context, or action",
+    description="Optional help text", placeholder="Optional example text inside the field",
+)
 @app_commands.checks.has_permissions(administrator=True)
-async def report_add_form_slot(interaction: discord.Interaction, panel_id: int):
-    panel=await db.panel(interaction.guild_id,panel_id)
-    if not panel: return await interaction.response.send_message("Panel not found.", ephemeral=True)
-    slots=await db.form_slots(panel)
-    maximum=4 if panel["evidence_enabled"] else 5
-    if len(slots)>=maximum:
-        return await interaction.response.send_message(f"No free slot. This form can have up to {maximum} text fields with the current evidence setting.", ephemeral=True)
-    await interaction.response.send_modal(FormSlotModal(panel_id))
+async def report_add_form_slot(
+    interaction: discord.Interaction, panel_id: int, label: str,
+    field_type: str = "short", required: bool = True, tracker_role: str = "custom",
+    description: str = "", placeholder: str = "",
+):
+    panel = await db.panel(interaction.guild_id, panel_id)
+    if not panel:
+        return await interaction.response.send_message("Panel not found. Run `/report panels` first.", ephemeral=True)
+    slots = await db.form_slots(panel)
+    maximum = 4 if panel["evidence_enabled"] else 5
+    if len(slots) >= maximum:
+        return await interaction.response.send_message(f"No free slot. Maximum is {maximum} text fields with the current evidence setting.", ephemeral=True)
+    field_type = field_type.strip().lower()
+    tracker_role = tracker_role.strip().lower()
+    if field_type not in {"short", "paragraph"}:
+        return await interaction.response.send_message("field_type must be `short` or `paragraph`.", ephemeral=True)
+    if tracker_role not in {"custom", "username", "discord_id", "rules", "context", "action"}:
+        return await interaction.response.send_message("Invalid tracker_role. Use custom, username, discord_id, rules, context, or action.", ephemeral=True)
+    label = label.strip()[:45]
+    if not label:
+        return await interaction.response.send_message("The field label cannot be empty.", ephemeral=True)
+    slot_id = await db.add_form_slot(panel_id, label, description.strip()[:100], placeholder.strip()[:100], field_type, required, tracker_role)
+    await interaction.response.send_message(f"Added **{label}** as slot **#{slot_id}** to panel **#{panel_id}**. The existing panel message was retained.", ephemeral=True)
 
 @report.command(name="edit-form-slot", description="Edit one existing form slot")
 @app_commands.checks.has_permissions(administrator=True)
@@ -1780,6 +1873,19 @@ async def report_edit_form(interaction: discord.Interaction, panel_id: int):
     embed.set_footer(text="Discord's yellow security/privacy warning is controlled by Discord and cannot be customized by bots.")
     await interaction.response.send_message(embed=embed, view=FormEditorView(panel_id, interaction.user.id), ephemeral=True)
 
+
+@report.command(name="set-form-title", description="Set a panel form title directly")
+@app_commands.describe(panel_id="Panel ID from /report panels", title="New title shown at the top of the form")
+@app_commands.checks.has_permissions(administrator=True)
+async def report_set_form_title(interaction: discord.Interaction, panel_id: int, title: str):
+    panel = await db.panel(interaction.guild_id, panel_id)
+    if not panel:
+        return await interaction.response.send_message("Panel not found. Run `/report panels` first.", ephemeral=True)
+    title = title.strip()[:45]
+    if not title:
+        return await interaction.response.send_message("The title cannot be empty.", ephemeral=True)
+    await db.update_panel(interaction.guild_id, panel_id, form_title=title)
+    await interaction.response.send_message(f"Panel **#{panel_id}** form title is now **{title}**. The existing panel message was retained.", ephemeral=True)
 
 @report.command(name="edit-form-labels", description="Customize the report form title for one panel")
 @app_commands.checks.has_permissions(administrator=True)
@@ -1891,7 +1997,7 @@ async def report_set_ticket_controls(
                 if embed:
                     instructions = []
                     if claim_button:
-                        instructions.append("Claim Ticket assigns the report to one staff member.")
+                        instructions.append("Claim Ticket assigns the report to one staff member. Deny Report marks it Rejected with a staff reason.")
                     if delete_button:
                         instructions.append("Delete Ticket removes the submission message but preserves tracking data.")
                     embed.set_footer(text=" ".join(instructions) if instructions else "This report panel has no claim or delete controls enabled.")
