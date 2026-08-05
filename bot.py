@@ -332,6 +332,19 @@ class Database:
             )
             await conn.commit()
 
+    async def replace_form_slots(self, panel_id: int, slots: list[tuple[str, str, str, str, bool, str]]) -> None:
+        """Replace all configurable text fields for a panel in one transaction."""
+        async with aiosqlite.connect(self.path) as conn:
+            await conn.execute("DELETE FROM panel_form_slots WHERE panel_id=?", (panel_id,))
+            await conn.executemany(
+                "INSERT INTO panel_form_slots(panel_id,label,description,placeholder,field_type,required,position,role) VALUES(?,?,?,?,?,?,?,?)",
+                [
+                    (panel_id, label, description, placeholder, field_type, int(required), position, role)
+                    for position, (label, description, placeholder, field_type, required, role) in enumerate(slots, 1)
+                ],
+            )
+            await conn.commit()
+
     async def create_panel(self, guild_id: int, name: str, channel_id: int, submission_channel_id: int, title: str, description: str, button_text: str, footer: str, color: int, created_by: int, claim_enabled: bool = True, delete_enabled: bool = True, deny_enabled: bool = True) -> int:
         async with aiosqlite.connect(self.path) as db:
             cur = await db.execute(
@@ -1444,7 +1457,7 @@ class FormEditorView(discord.ui.View):
 
 
 class PanelCustomizeModal(discord.ui.Modal):
-    def __init__(self, bot: "ReportBot", *, mode: str, panel_name: str = "", channel: Optional[discord.TextChannel] = None, submission_channel: Optional[discord.TextChannel] = None, panel=None, claim_enabled: bool = True, delete_enabled: bool = True, deny_enabled: bool = True):
+    def __init__(self, bot: "ReportBot", *, mode: str, panel_name: str = "", channel: Optional[discord.TextChannel] = None, submission_channel: Optional[discord.TextChannel] = None, panel=None, claim_enabled: bool = True, delete_enabled: bool = True, deny_enabled: bool = True, form_preset: str = "discord"):
         super().__init__(title="Create Report Panel" if mode == "create" else f"Edit Panel #{panel['id']}", timeout=600)
         self.bot = bot
         self.mode = mode
@@ -1455,9 +1468,17 @@ class PanelCustomizeModal(discord.ui.Modal):
         self.claim_enabled = claim_enabled
         self.delete_enabled = delete_enabled
         self.deny_enabled = deny_enabled
-        self.title_input = discord.ui.TextInput(label="Panel title", default=(panel["title"] if panel else "Discord Report Center"), max_length=256)
-        self.description_input = discord.ui.TextInput(label="Description", style=discord.TextStyle.paragraph, default=(panel["description"] if panel else "Press File Report to submit a private report with image or video evidence."), max_length=2000)
-        self.button_input = discord.ui.TextInput(label="Button text", default=(panel["button_text"] if panel else "File Report"), max_length=80)
+        self.form_preset = form_preset
+        default_panel_title = "Game Report Center" if form_preset == "game" else "Discord Report Center"
+        default_description = (
+            "Press File Game Report to report an in-game Roblox violation with supporting evidence."
+            if form_preset == "game"
+            else "Press File Report to submit a private report with image or video evidence."
+        )
+        default_button = "File Game Report" if form_preset == "game" else "File Report"
+        self.title_input = discord.ui.TextInput(label="Panel title", default=(panel["title"] if panel else default_panel_title), max_length=256)
+        self.description_input = discord.ui.TextInput(label="Description", style=discord.TextStyle.paragraph, default=(panel["description"] if panel else default_description), max_length=2000)
+        self.button_input = discord.ui.TextInput(label="Button text", default=(panel["button_text"] if panel else default_button), max_length=80)
         self.footer_input = discord.ui.TextInput(label="Footer", default=(panel["footer"] if panel else "Reports are visible only to authorized staff."), required=False, max_length=2048)
         self.color_input = discord.ui.TextInput(label="Hex color", default=(f"#{panel['color']:06X}" if panel else "#DD2E44"), max_length=7)
         for item in (self.title_input, self.description_input, self.button_input, self.footer_input, self.color_input):
@@ -1482,6 +1503,34 @@ class PanelCustomizeModal(discord.ui.Modal):
                 panel_id = await db.create_panel(interaction.guild_id, self.panel_name, self.channel.id, self.submission_channel.id, title, description, button_text, footer, color, interaction.user.id, self.claim_enabled, self.delete_enabled, self.deny_enabled)
             except aiosqlite.IntegrityError:
                 return await interaction.followup.send("A panel with that name already exists. Choose another name.", ephemeral=True)
+            if self.form_preset == "game":
+                await db.update_panel(
+                    interaction.guild_id,
+                    panel_id,
+                    form_title="File a Game Report",
+                    username_label="Roblox Username",
+                    username_description="Enter the reported player's Roblox username.",
+                    username_placeholder="Example: RobloxUsername",
+                    username_required=1,
+                    rules_label="Rules Broken",
+                    rules_description="List the game rule or rules that were violated.",
+                    rules_placeholder="Example: Exploiting, spawn killing, harassment",
+                    rules_required=1,
+                    context_label="Context",
+                    context_description="Explain what happened in the game.",
+                    context_placeholder="Include what happened, when it happened, and relevant server details.",
+                    context_required=1,
+                    evidence_label="Evidence",
+                    evidence_description="Upload screenshots or video evidence.",
+                    evidence_required=0,
+                    evidence_max=10,
+                    evidence_enabled=1,
+                )
+                await db.replace_form_slots(panel_id, [
+                    ("Roblox Username", "Enter the reported player's Roblox username.", "Example: RobloxUsername", "short", True, "username"),
+                    ("Rules Broken", "List the game rule or rules that were violated.", "Example: Exploiting, spawn killing, harassment", "short", True, "rules"),
+                    ("Context", "Explain what happened in the game.", "Include what happened, when it happened, and relevant server details.", "paragraph", True, "context"),
+                ])
             message = await self.channel.send(embed=embed, view=ReportPanelView(self.bot, button_text))
             await db.set_panel_message(panel_id, self.channel.id, message.id)
             await interaction.followup.send(
@@ -1789,6 +1838,34 @@ async def report_create_panel(
     await interaction.response.send_modal(PanelCustomizeModal(
         bot, mode="create", panel_name=clean_name, channel=panel_channel,
         submission_channel=submission_channel, claim_enabled=claim_button, delete_enabled=delete_button, deny_enabled=deny_button,
+    ))
+
+@report.command(name="create-game-panel", description="Create a Roblox game-report panel with Roblox Username, Rules, Context, and Evidence")
+@app_commands.describe(
+    name="A unique name used to manage this game-report panel",
+    panel_channel="Channel where the game-report panel will be posted",
+    submission_channel="Private staff channel where submitted game reports will be sent",
+    claim_button="Show the Claim Ticket button on submissions",
+    deny_button="Show the Deny Report button on submissions",
+    delete_button="Show the Delete Ticket button on submissions",
+)
+@app_commands.checks.has_permissions(administrator=True)
+async def report_create_game_panel(
+    interaction: discord.Interaction,
+    name: str,
+    panel_channel: discord.TextChannel,
+    submission_channel: discord.TextChannel,
+    claim_button: bool = True,
+    deny_button: bool = True,
+    delete_button: bool = True,
+):
+    clean_name = name.strip()[:60]
+    if not clean_name:
+        return await interaction.response.send_message("Enter a panel name.", ephemeral=True)
+    await interaction.response.send_modal(PanelCustomizeModal(
+        bot, mode="create", panel_name=clean_name, channel=panel_channel,
+        submission_channel=submission_channel, claim_enabled=claim_button,
+        delete_enabled=delete_button, deny_enabled=deny_button, form_preset="game",
     ))
 
 @report.command(name="edit-panel", description="Customize one of your existing report panels")
