@@ -960,6 +960,40 @@ async def is_ticket_staff(member: discord.Member, panel_id: Optional[int] = None
     )
 
 
+async def resolve_report_from_interaction(interaction: discord.Interaction):
+    """Resolve a ticket record and repair old/missing message mappings."""
+    if not interaction.guild_id or not interaction.channel_id or not interaction.message:
+        return None
+
+    row = await db.report_by_message(
+        interaction.guild_id, interaction.channel_id, interaction.message.id
+    )
+    if row:
+        return row
+
+    # Older versions sometimes stored an incomplete message mapping. Recover the
+    # report number from the embed title, then repair the database mapping.
+    report_id = None
+    for embed in interaction.message.embeds:
+        match = re.search(r"#(\d+)", embed.title or "")
+        if match:
+            report_id = int(match.group(1))
+            break
+
+    if report_id is not None:
+        row = await db.report(interaction.guild_id, report_id)
+        if row:
+            await db.set_report_message(report_id, interaction.channel_id, interaction.message.id)
+            return await db.report(interaction.guild_id, report_id)
+
+    # Final fallback for ticket-channel style reports.
+    row = await db.report_by_ticket(interaction.guild_id, interaction.channel_id)
+    if row:
+        await db.set_report_message(row["id"], interaction.channel_id, interaction.message.id)
+        return await db.report(interaction.guild_id, row["id"])
+    return None
+
+
 class TicketControlsView(discord.ui.View):
     def __init__(self, bot: "ReportBot", claimed: bool = False, claim_enabled: bool = True, delete_enabled: bool = True, deny_enabled: bool = True):
         super().__init__(timeout=None)
@@ -981,9 +1015,10 @@ class TicketControlsView(discord.ui.View):
     async def claim(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not interaction.guild or not isinstance(interaction.user, discord.Member):
             return await interaction.response.send_message("This button can only be used inside a server.", ephemeral=True)
-        row = await db.report_by_message(interaction.guild_id, interaction.channel_id, interaction.message.id)
+        row = await resolve_report_from_interaction(interaction)
         if not row:
-            return await interaction.response.send_message("This channel is not connected to a tracked report.", ephemeral=True)
+            # Remove stale controls without posting an extra error message.
+            return await interaction.response.edit_message(view=None)
         if not await is_ticket_staff(interaction.user, row["panel_id"]):
             return await interaction.response.send_message("You cannot claim this ticket. Ask an administrator to add your role with `/setup add-staff-role`, or authorize it for this panel.", ephemeral=True)
         if row["assigned_to"]:
@@ -1012,9 +1047,9 @@ class TicketControlsView(discord.ui.View):
     async def deny(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not interaction.guild or not isinstance(interaction.user, discord.Member):
             return await interaction.response.send_message("This button can only be used inside a server.", ephemeral=True)
-        row = await db.report_by_message(interaction.guild_id, interaction.channel_id, interaction.message.id)
+        row = await resolve_report_from_interaction(interaction)
         if not row:
-            return await interaction.response.send_message("This message is not connected to a tracked report.", ephemeral=True)
+            return await interaction.response.edit_message(view=None)
         if not await is_ticket_staff(interaction.user, row["panel_id"]):
             return await interaction.response.send_message("Only an administrator or configured staff role can deny this report.", ephemeral=True)
         await interaction.response.send_modal(DenyReportModal(self.bot, row["id"]))
@@ -1026,9 +1061,10 @@ class TicketControlsView(discord.ui.View):
     async def delete(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not interaction.guild or not isinstance(interaction.user, discord.Member):
             return await interaction.response.send_message("This button can only be used inside a server.", ephemeral=True)
-        row = await db.report_by_message(interaction.guild_id, interaction.channel_id, interaction.message.id)
+        row = await resolve_report_from_interaction(interaction)
         if not row:
-            return await interaction.response.send_message("This channel is not connected to a tracked report.", ephemeral=True)
+            # Remove stale controls without posting an extra error message.
+            return await interaction.response.edit_message(view=None)
         if not await is_ticket_staff(interaction.user, row["panel_id"]):
             return await interaction.response.send_message("You cannot delete this ticket. Ask an administrator to add your role with `/setup add-staff-role`, or authorize it for this panel.", ephemeral=True)
         await db.delete_report_ticket(interaction.guild_id, row["id"], interaction.user.id)
