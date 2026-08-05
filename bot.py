@@ -1324,10 +1324,12 @@ class FormSlotSelect(discord.ui.Select):
 
 
 class FormSlotManagerView(discord.ui.View):
-    def __init__(self, panel_id: int, owner_id: int, slots):
+    def __init__(self, panel, owner_id: int, slots):
         super().__init__(timeout=600)
-        self.panel_id = panel_id
+        self.panel_id = int(panel["id"])
         self.owner_id = owner_id
+        self.evidence_enabled = bool(panel["evidence_enabled"])
+        self.slots = {int(slot["id"]): slot for slot in slots}
         self.selected_slot_id = None
         self.add_item(FormSlotSelect(slots))
 
@@ -1339,38 +1341,48 @@ class FormSlotManagerView(discord.ui.View):
             return False
         return True
 
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item):
+        print(f"FormSlotManagerView error on {type(item).__name__}: {error!r}")
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send("The field editor encountered an error. Reopen `/report edit-form` and try again.", ephemeral=True)
+            else:
+                await interaction.response.send_message("The field editor encountered an error. Reopen `/report edit-form` and try again.", ephemeral=True)
+        except Exception:
+            pass
+
     @discord.ui.button(label="Add Field", style=discord.ButtonStyle.success, emoji="➕", row=1)
     async def add_field(self, interaction: discord.Interaction, button: discord.ui.Button):
-        panel = await db.panel(interaction.guild_id, self.panel_id)
-        if not panel:
-            return await interaction.response.send_message("Panel no longer exists.", ephemeral=True)
-        slots = await db.form_slots(panel)
-        maximum = 4 if panel["evidence_enabled"] else 5
-        if len(slots) >= maximum:
+        maximum = 4 if self.evidence_enabled else 5
+        if len(self.slots) >= maximum:
             return await interaction.response.send_message(
                 f"No free field slot. This form supports {maximum} text fields with the current evidence setting.",
                 ephemeral=True,
             )
+        # Open the modal immediately. Database work happens only after modal submission.
         await interaction.response.send_modal(FormSlotModal(self.panel_id))
 
     @discord.ui.button(label="Edit Selected", style=discord.ButtonStyle.primary, emoji="✏️", row=1)
     async def edit_selected(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not self.selected_slot_id:
             return await interaction.response.send_message("Select a field first.", ephemeral=True)
-        slot = await db.form_slot(self.panel_id, self.selected_slot_id)
+        slot = self.slots.get(self.selected_slot_id)
         if not slot:
-            return await interaction.response.send_message("That field no longer exists. Reopen the manager.", ephemeral=True)
+            return await interaction.response.send_message("That field is no longer available. Reopen the manager.", ephemeral=True)
+        # Use the cached slot so Discord receives the modal within its 3-second limit.
         await interaction.response.send_modal(FormSlotModal(self.panel_id, slot))
 
     @discord.ui.button(label="Delete Selected", style=discord.ButtonStyle.danger, emoji="🗑️", row=1)
     async def delete_selected(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not self.selected_slot_id:
             return await interaction.response.send_message("Select a field first.", ephemeral=True)
-        slot = await db.form_slot(self.panel_id, self.selected_slot_id)
+        slot = self.slots.get(self.selected_slot_id)
         if not slot:
-            return await interaction.response.send_message("That field no longer exists. Reopen the manager.", ephemeral=True)
+            return await interaction.response.send_message("That field is no longer available. Reopen the manager.", ephemeral=True)
+        await interaction.response.defer(ephemeral=True)
         await db.delete_form_slot(self.panel_id, self.selected_slot_id)
-        await interaction.response.send_message(
+        self.slots.pop(self.selected_slot_id, None)
+        await interaction.followup.send(
             f"Deleted **{slot['label']}** from panel **#{self.panel_id}**. Reopen `/report edit-form` to refresh the list.",
             ephemeral=True,
         )
@@ -1419,7 +1431,7 @@ class FormEditorView(discord.ui.View):
         embed.set_footer(text="Select a field, then edit or delete it. Deleting affects future submissions only.")
         await interaction.response.send_message(
             embed=embed,
-            view=FormSlotManagerView(self.panel_id, interaction.user.id, slots),
+            view=FormSlotManagerView(panel, interaction.user.id, slots),
             ephemeral=True,
         )
 
