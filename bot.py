@@ -1813,21 +1813,27 @@ async def warn(
     await create_name_only_case(interaction, "warn", target, reason, attachments=collect_evidence(evidence, evidence_2, evidence_3))
 
 
-@report.command(name="create-panel", description="Create and post a separately customized report panel")
+@report.command(name="create-panel", description="Create a Discord or Roblox game report panel")
 @app_commands.describe(
     name="A unique name used to manage this panel",
-    panel_channel="Channel where the File Report panel will be posted",
+    panel_channel="Channel where the report panel will be posted",
     submission_channel="Private staff channel where submitted reports will be sent",
+    preset="Choose the starting form: Discord Report or Game Report",
     claim_button="Show the Claim Ticket button on submissions",
     deny_button="Show the Deny Report button on submissions",
     delete_button="Show the Delete Ticket button on submissions",
 )
+@app_commands.choices(preset=[
+    app_commands.Choice(name="Discord Report", value="discord"),
+    app_commands.Choice(name="Game Report", value="game"),
+])
 @app_commands.checks.has_permissions(administrator=True)
 async def report_create_panel(
     interaction: discord.Interaction,
     name: str,
     panel_channel: discord.TextChannel,
     submission_channel: discord.TextChannel,
+    preset: app_commands.Choice[str],
     claim_button: bool = True,
     deny_button: bool = True,
     delete_button: bool = True,
@@ -1835,37 +1841,17 @@ async def report_create_panel(
     clean_name = name.strip()[:60]
     if not clean_name:
         return await interaction.response.send_message("Enter a panel name.", ephemeral=True)
+    form_preset = preset.value if preset else "discord"
     await interaction.response.send_modal(PanelCustomizeModal(
-        bot, mode="create", panel_name=clean_name, channel=panel_channel,
-        submission_channel=submission_channel, claim_enabled=claim_button, delete_enabled=delete_button, deny_enabled=deny_button,
-    ))
-
-@report.command(name="create-game-panel", description="Create a Roblox game-report panel with Roblox Username, Rules, Context, and Evidence")
-@app_commands.describe(
-    name="A unique name used to manage this game-report panel",
-    panel_channel="Channel where the game-report panel will be posted",
-    submission_channel="Private staff channel where submitted game reports will be sent",
-    claim_button="Show the Claim Ticket button on submissions",
-    deny_button="Show the Deny Report button on submissions",
-    delete_button="Show the Delete Ticket button on submissions",
-)
-@app_commands.checks.has_permissions(administrator=True)
-async def report_create_game_panel(
-    interaction: discord.Interaction,
-    name: str,
-    panel_channel: discord.TextChannel,
-    submission_channel: discord.TextChannel,
-    claim_button: bool = True,
-    deny_button: bool = True,
-    delete_button: bool = True,
-):
-    clean_name = name.strip()[:60]
-    if not clean_name:
-        return await interaction.response.send_message("Enter a panel name.", ephemeral=True)
-    await interaction.response.send_modal(PanelCustomizeModal(
-        bot, mode="create", panel_name=clean_name, channel=panel_channel,
-        submission_channel=submission_channel, claim_enabled=claim_button,
-        delete_enabled=delete_button, deny_enabled=deny_button, form_preset="game",
+        bot,
+        mode="create",
+        panel_name=clean_name,
+        channel=panel_channel,
+        submission_channel=submission_channel,
+        claim_enabled=claim_button,
+        delete_enabled=delete_button,
+        deny_enabled=deny_button,
+        form_preset=form_preset,
     ))
 
 @report.command(name="edit-panel", description="Customize one of your existing report panels")
