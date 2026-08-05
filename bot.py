@@ -332,11 +332,11 @@ class Database:
             )
             await conn.commit()
 
-    async def create_panel(self, guild_id: int, name: str, channel_id: int, submission_channel_id: int, title: str, description: str, button_text: str, footer: str, color: int, created_by: int, claim_enabled: bool = True, delete_enabled: bool = True) -> int:
+    async def create_panel(self, guild_id: int, name: str, channel_id: int, submission_channel_id: int, title: str, description: str, button_text: str, footer: str, color: int, created_by: int, claim_enabled: bool = True, delete_enabled: bool = True, deny_enabled: bool = True) -> int:
         async with aiosqlite.connect(self.path) as db:
             cur = await db.execute(
-                "INSERT INTO report_panels(guild_id,name,channel_id,submission_channel_id,title,description,button_text,footer,color,created_by,claim_enabled,delete_enabled) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-                (guild_id, name, channel_id, submission_channel_id, title, description, button_text, footer, color, created_by, int(claim_enabled), int(delete_enabled)),
+                "INSERT INTO report_panels(guild_id,name,channel_id,submission_channel_id,title,description,button_text,footer,color,created_by,claim_enabled,delete_enabled,deny_enabled) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (guild_id, name, channel_id, submission_channel_id, title, description, button_text, footer, color, created_by, int(claim_enabled), int(delete_enabled), int(deny_enabled)),
             )
             await db.commit()
             return cur.lastrowid
@@ -844,7 +844,7 @@ class ReportModal(discord.ui.Modal):
                 files.append(discord.File(io.BytesIO(await attachment.read()), filename=attachment.filename))
             except discord.HTTPException:
                 pass
-        embed = build_dynamic_ticket_embed(report_id, interaction.user, field_values, len(files), "Open", None, self.claim_enabled, self.delete_enabled)
+        embed = build_dynamic_ticket_embed(report_id, interaction.user, field_values, len(files), "Open", None, self.claim_enabled, self.delete_enabled, bool(self.panel["deny_enabled"]) if "deny_enabled" in self.panel.keys() else True)
         controls = TicketControlsView(self.bot, claim_enabled=self.claim_enabled, delete_enabled=self.delete_enabled, deny_enabled=bool(self.panel["deny_enabled"]) if "deny_enabled" in self.panel.keys() else True)
         message = await submission_channel.send(content=f"New report submitted by {interaction.user.mention}.", embed=embed, files=files, view=controls if controls.children else None)
         for original, uploaded in zip(attachments, message.attachments):
@@ -881,7 +881,7 @@ class ReportModal(discord.ui.Modal):
         await interaction.followup.send(f"Your report was submitted successfully. Tracking number: **#{report_id}**", ephemeral=True)
 
 
-def build_dynamic_ticket_embed(report_id, reporter, field_values, evidence_count, status, assigned_to, claim_enabled=True, delete_enabled=True):
+def build_dynamic_ticket_embed(report_id, reporter, field_values, evidence_count, status, assigned_to, claim_enabled=True, delete_enabled=True, deny_enabled=True):
     color = 0xF1C40F if status == "Open" else 0x3498DB
     embed = discord.Embed(title=f"Discord Report Ticket #{report_id}", color=color, timestamp=discord.utils.utcnow())
     embed.add_field(name="Reporter", value=f"{reporter.mention} (`{reporter.id}`)", inline=False)
@@ -891,9 +891,10 @@ def build_dynamic_ticket_embed(report_id, reporter, field_values, evidence_count
     embed.add_field(name="Claimed by", value=f"<@{assigned_to}>" if assigned_to else "Unclaimed")
     embed.add_field(name="Evidence", value=f"{evidence_count} file(s)")
     instructions=[]
-    if claim_enabled: instructions.append("Claim Ticket assigns the report to one staff member. Deny Report marks it Rejected with a staff reason.")
+    if claim_enabled: instructions.append("Claim Ticket assigns the report to one staff member.")
+    if deny_enabled: instructions.append("Deny Report marks it Rejected with a staff reason.")
     if delete_enabled: instructions.append("Delete Ticket removes the message but preserves tracking data.")
-    embed.set_footer(text=" ".join(instructions) if instructions else "This report has no claim or delete controls enabled.")
+    embed.set_footer(text=" ".join(instructions) if instructions else "This report has no ticket controls enabled.")
     return embed
 
 
@@ -1394,7 +1395,7 @@ class FormEditorView(discord.ui.View):
 
 
 class PanelCustomizeModal(discord.ui.Modal):
-    def __init__(self, bot: "ReportBot", *, mode: str, panel_name: str = "", channel: Optional[discord.TextChannel] = None, submission_channel: Optional[discord.TextChannel] = None, panel=None, claim_enabled: bool = True, delete_enabled: bool = True):
+    def __init__(self, bot: "ReportBot", *, mode: str, panel_name: str = "", channel: Optional[discord.TextChannel] = None, submission_channel: Optional[discord.TextChannel] = None, panel=None, claim_enabled: bool = True, delete_enabled: bool = True, deny_enabled: bool = True):
         super().__init__(title="Create Report Panel" if mode == "create" else f"Edit Panel #{panel['id']}", timeout=600)
         self.bot = bot
         self.mode = mode
@@ -1404,6 +1405,7 @@ class PanelCustomizeModal(discord.ui.Modal):
         self.panel = panel
         self.claim_enabled = claim_enabled
         self.delete_enabled = delete_enabled
+        self.deny_enabled = deny_enabled
         self.title_input = discord.ui.TextInput(label="Panel title", default=(panel["title"] if panel else "Discord Report Center"), max_length=256)
         self.description_input = discord.ui.TextInput(label="Description", style=discord.TextStyle.paragraph, default=(panel["description"] if panel else "Press File Report to submit a private report with image or video evidence."), max_length=2000)
         self.button_input = discord.ui.TextInput(label="Button text", default=(panel["button_text"] if panel else "File Report"), max_length=80)
@@ -1428,7 +1430,7 @@ class PanelCustomizeModal(discord.ui.Modal):
         if self.mode == "create":
             await interaction.response.defer(ephemeral=True, thinking=True)
             try:
-                panel_id = await db.create_panel(interaction.guild_id, self.panel_name, self.channel.id, self.submission_channel.id, title, description, button_text, footer, color, interaction.user.id, self.claim_enabled, self.delete_enabled)
+                panel_id = await db.create_panel(interaction.guild_id, self.panel_name, self.channel.id, self.submission_channel.id, title, description, button_text, footer, color, interaction.user.id, self.claim_enabled, self.delete_enabled, self.deny_enabled)
             except aiosqlite.IntegrityError:
                 return await interaction.followup.send("A panel with that name already exists. Choose another name.", ephemeral=True)
             message = await self.channel.send(embed=embed, view=ReportPanelView(self.bot, button_text))
@@ -1436,7 +1438,7 @@ class PanelCustomizeModal(discord.ui.Modal):
             await interaction.followup.send(
                 f"Panel **#{panel_id} — {self.panel_name}** was posted in {self.channel.mention}. "
                 f"Submissions will go to {self.submission_channel.mention}. "
-                f"Claim: **{'ON' if self.claim_enabled else 'OFF'}** • Delete: **{'ON' if self.delete_enabled else 'OFF'}**.",
+                f"Claim: **{'ON' if self.claim_enabled else 'OFF'}** • Deny: **{'ON' if self.deny_enabled else 'OFF'}** • Delete: **{'ON' if self.delete_enabled else 'OFF'}**.",
                 ephemeral=True,
             )
             return
@@ -1718,6 +1720,9 @@ async def warn(
     name="A unique name used to manage this panel",
     panel_channel="Channel where the File Report panel will be posted",
     submission_channel="Private staff channel where submitted reports will be sent",
+    claim_button="Show the Claim Ticket button on submissions",
+    deny_button="Show the Deny Report button on submissions",
+    delete_button="Show the Delete Ticket button on submissions",
 )
 @app_commands.checks.has_permissions(administrator=True)
 async def report_create_panel(
@@ -1726,6 +1731,7 @@ async def report_create_panel(
     panel_channel: discord.TextChannel,
     submission_channel: discord.TextChannel,
     claim_button: bool = True,
+    deny_button: bool = True,
     delete_button: bool = True,
 ):
     clean_name = name.strip()[:60]
@@ -1733,7 +1739,7 @@ async def report_create_panel(
         return await interaction.response.send_message("Enter a panel name.", ephemeral=True)
     await interaction.response.send_modal(PanelCustomizeModal(
         bot, mode="create", panel_name=clean_name, channel=panel_channel,
-        submission_channel=submission_channel, claim_enabled=claim_button, delete_enabled=delete_button,
+        submission_channel=submission_channel, claim_enabled=claim_button, delete_enabled=delete_button, deny_enabled=deny_button,
     ))
 
 @report.command(name="edit-panel", description="Customize one of your existing report panels")
@@ -1955,10 +1961,11 @@ async def report_set_evidence_label(interaction: discord.Interaction, panel_id: 
     await interaction.response.send_message(f"Evidence label for panel **#{panel_id}** updated.", ephemeral=True)
 
 
-@report.command(name="set-ticket-controls", description="Turn Claim and Delete buttons on or off for one panel")
+@report.command(name="set-ticket-controls", description="Turn Claim, Deny, and Delete buttons on or off for one panel")
 @app_commands.describe(
     panel_id="Panel ID from /report panels",
     claim_button="Show or remove the Claim Ticket button",
+    deny_button="Show or remove the Deny Report button",
     delete_button="Show or remove the Delete Ticket button",
     update_existing="Also update existing active submissions from this panel",
 )
@@ -1967,6 +1974,7 @@ async def report_set_ticket_controls(
     interaction: discord.Interaction,
     panel_id: int,
     claim_button: bool,
+    deny_button: bool,
     delete_button: bool,
     update_existing: bool = True,
 ):
@@ -1976,7 +1984,7 @@ async def report_set_ticket_controls(
     await interaction.response.defer(ephemeral=True, thinking=True)
     await db.update_panel(
         interaction.guild_id, panel_id,
-        claim_enabled=int(claim_button), delete_enabled=int(delete_button),
+        claim_enabled=int(claim_button), deny_enabled=int(deny_button), delete_enabled=int(delete_button),
     )
     updated = 0
     failed = 0
@@ -1991,16 +1999,18 @@ async def report_set_ticket_controls(
                 message = await channel.fetch_message(row["log_message"])
                 controls = TicketControlsView(
                     bot, claimed=bool(row["assigned_to"]),
-                    claim_enabled=claim_button, delete_enabled=delete_button,
+                    claim_enabled=claim_button, delete_enabled=delete_button, deny_enabled=deny_button,
                 )
                 embed = message.embeds[0] if message.embeds else None
                 if embed:
                     instructions = []
                     if claim_button:
-                        instructions.append("Claim Ticket assigns the report to one staff member. Deny Report marks it Rejected with a staff reason.")
+                        instructions.append("Claim Ticket assigns the report to one staff member.")
+                    if deny_button:
+                        instructions.append("Deny Report marks it Rejected with a staff reason.")
                     if delete_button:
                         instructions.append("Delete Ticket removes the submission message but preserves tracking data.")
-                    embed.set_footer(text=" ".join(instructions) if instructions else "This report panel has no claim or delete controls enabled.")
+                    embed.set_footer(text=" ".join(instructions) if instructions else "This report panel has no ticket controls enabled.")
                 await message.edit(embed=embed, view=controls if controls.children else None)
                 updated += 1
             except (discord.NotFound, discord.Forbidden, discord.HTTPException):
@@ -2010,7 +2020,7 @@ async def report_set_ticket_controls(
         extra += f"; unavailable: **{failed}**"
     await interaction.followup.send(
         f"Panel **#{panel_id}** controls updated. Claim: **{'ON' if claim_button else 'OFF'}** • "
-        f"Delete: **{'ON' if delete_button else 'OFF'}**.{extra if update_existing else ''}",
+        f"Deny: **{'ON' if deny_button else 'OFF'}** • Delete: **{'ON' if delete_button else 'OFF'}**.{extra if update_existing else ''}",
         ephemeral=True,
     )
 
@@ -2027,10 +2037,11 @@ async def report_panels(interaction: discord.Interaction):
         destination = interaction.guild.get_channel(row["submission_channel_id"]) if row["submission_channel_id"] else None
         destination_text = destination.mention if isinstance(destination, discord.TextChannel) else "Not configured"
         claim_text = "ON" if row["claim_enabled"] else "OFF"
+        deny_text = "ON" if row["deny_enabled"] else "OFF"
         delete_text = "ON" if row["delete_enabled"] else "OFF"
         lines.append(
             f"**#{row['id']} — {row['name']}**\nPanel: {location} • Submissions: {destination_text}\n"
-            f"Claim button: **{claim_text}** • Delete button: **{delete_text}**\nForm: **{row['form_title']}**"
+            f"Claim: **{claim_text}** • Deny: **{deny_text}** • Delete: **{delete_text}**\nForm: **{row['form_title']}**"
         )
     embed = discord.Embed(title="Saved Report Panels", description="\n".join(lines), color=0x5865F2)
     embed.set_footer(text="Use the panel ID with /report edit-panel or /report edit-form.")
@@ -2063,6 +2074,7 @@ async def report_panel(
     panel_channel: discord.TextChannel,
     submission_channel: discord.TextChannel,
     claim_button: bool = True,
+    deny_button: bool = True,
     delete_button: bool = True,
 ):
     name = f"Panel {discord.utils.utcnow().strftime('%Y%m%d-%H%M%S')}"
@@ -2070,7 +2082,7 @@ async def report_panel(
         PanelCustomizeModal(
             bot, mode="create", panel_name=name, channel=panel_channel,
             submission_channel=submission_channel, claim_enabled=claim_button,
-            delete_enabled=delete_button,
+            delete_enabled=delete_button, deny_enabled=deny_button,
         )
     )
 
