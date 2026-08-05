@@ -1568,10 +1568,16 @@ class ReportBot(commands.Bot):
         self.add_view(TicketControlsView(self))
         if DEV_GUILD_ID:
             guild = discord.Object(id=DEV_GUILD_ID)
-            self.tree.copy_global_to(guild=guild)
+            # Remove stale guild command definitions first, then publish the exact
+            # signatures registered by this running version of the bot.
+            self.tree.clear_commands(guild=guild)
             await self.tree.sync(guild=guild)
+            self.tree.copy_global_to(guild=guild)
+            synced = await self.tree.sync(guild=guild)
+            print(f"Clean-synced {len(synced)} guild commands to {DEV_GUILD_ID}.")
         else:
-            await self.tree.sync()
+            synced = await self.tree.sync()
+            print(f"Synced {len(synced)} global commands.")
 
 bot = ReportBot()
 setup = app_commands.Group(name="setup", description="Configure bot log channels")
@@ -1833,7 +1839,7 @@ async def report_create_panel(
     name: str,
     panel_channel: discord.TextChannel,
     submission_channel: discord.TextChannel,
-    preset: app_commands.Choice[str],
+    preset: Optional[app_commands.Choice[str]] = None,
     claim_button: bool = True,
     deny_button: bool = True,
     delete_button: bool = True,
