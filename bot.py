@@ -1389,9 +1389,10 @@ class FormSlotManagerView(discord.ui.View):
 
 
 class FormEditorView(discord.ui.View):
-    def __init__(self, panel_id: int, owner_id: int):
+    def __init__(self, panel, owner_id: int):
         super().__init__(timeout=600)
-        self.panel_id = panel_id
+        self.panel = panel
+        self.panel_id = int(panel["id"])
         self.owner_id = owner_id
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
@@ -1408,15 +1409,17 @@ class FormEditorView(discord.ui.View):
 
     @discord.ui.button(label="Form Title", style=discord.ButtonStyle.primary, emoji="📝")
     async def title_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        panel = await self.get_panel(interaction)
-        if panel:
-            await interaction.response.send_modal(FormLabelsModal(panel))
+        # A modal must be the interaction's first response. Use the panel snapshot
+        # loaded when /report edit-form was opened instead of waiting on SQLite.
+        await interaction.response.send_modal(FormLabelsModal(self.panel))
 
     @discord.ui.button(label="Manage Fields", style=discord.ButtonStyle.primary, emoji="🧩")
     async def fields_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        panel = await self.get_panel(interaction)
+        await interaction.response.defer(ephemeral=True)
+        panel = await db.panel(interaction.guild_id, self.panel_id)
         if not panel:
-            return
+            return await interaction.followup.send("Panel no longer exists.", ephemeral=True)
+        self.panel = panel
         slots = await db.form_slots(panel)
         lines = [
             f"`#{slot['id']}` **{slot['label']}** — {slot['field_type']} • "
@@ -1429,7 +1432,7 @@ class FormEditorView(discord.ui.View):
             color=panel["color"],
         )
         embed.set_footer(text="Select a field, then edit or delete it. Deleting affects future submissions only.")
-        await interaction.response.send_message(
+        await interaction.followup.send(
             embed=embed,
             view=FormSlotManagerView(panel, interaction.user.id, slots),
             ephemeral=True,
@@ -1437,9 +1440,7 @@ class FormEditorView(discord.ui.View):
 
     @discord.ui.button(label="Evidence", style=discord.ButtonStyle.success, emoji="📎")
     async def evidence_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        panel = await self.get_panel(interaction)
-        if panel:
-            await interaction.response.send_modal(FormEvidenceModal(panel))
+        await interaction.response.send_modal(FormEvidenceModal(self.panel))
 
 
 class PanelCustomizeModal(discord.ui.Modal):
@@ -1925,7 +1926,7 @@ async def report_edit_form(interaction: discord.Interaction, panel_id: int):
         color=panel["color"],
     )
     embed.set_footer(text="Discord's yellow security/privacy warning is controlled by Discord and cannot be customized by bots.")
-    await interaction.response.send_message(embed=embed, view=FormEditorView(panel_id, interaction.user.id), ephemeral=True)
+    await interaction.response.send_message(embed=embed, view=FormEditorView(panel, interaction.user.id), ephemeral=True)
 
 
 @report.command(name="set-form-title", description="Set a panel form title directly")
