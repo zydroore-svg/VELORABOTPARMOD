@@ -1105,7 +1105,6 @@ class TicketControlsView(discord.ui.View):
         await send_ticket_action_notification(
             interaction.guild, panel, row, "Claimed", interaction.user, source_message=interaction.message
         )
-        await interaction.followup.send(f"Ticket claimed by {interaction.user.mention}.")
 
     @discord.ui.button(
         label="Deny Report", style=discord.ButtonStyle.secondary, emoji="⛔",
