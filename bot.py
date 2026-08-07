@@ -58,6 +58,7 @@ class Database:
                     ban_channel INTEGER, appeal_channel INTEGER, report_channel INTEGER,
                     panel_channel INTEGER, panel_message INTEGER,
                     ticket_category INTEGER, warn_alert_channel INTEGER,
+                    discord_report_alert_channel INTEGER, game_report_alert_channel INTEGER,
                     panel_title TEXT DEFAULT 'Discord Report Center',
                     panel_description TEXT DEFAULT 'Press File Report to submit a private Discord user report with image or video evidence.',
                     panel_button TEXT DEFAULT 'File Report',
@@ -169,6 +170,8 @@ class Database:
                     claim_enabled INTEGER NOT NULL DEFAULT 1,
                     delete_enabled INTEGER NOT NULL DEFAULT 1,
                     deny_enabled INTEGER NOT NULL DEFAULT 1,
+                    notification_channel_id INTEGER,
+                    report_type TEXT NOT NULL DEFAULT 'discord',
                     form_title TEXT NOT NULL DEFAULT 'File a Discord Report',
                     username_label TEXT NOT NULL DEFAULT 'Discord Username',
                     username_description TEXT NOT NULL DEFAULT 'Enter the reported user name.',
@@ -208,6 +211,8 @@ class Database:
             for statement in (
                 "ALTER TABLE settings ADD COLUMN ticket_category INTEGER",
                 "ALTER TABLE settings ADD COLUMN warn_alert_channel INTEGER",
+                "ALTER TABLE settings ADD COLUMN discord_report_alert_channel INTEGER",
+                "ALTER TABLE settings ADD COLUMN game_report_alert_channel INTEGER",
                 "ALTER TABLE reports ADD COLUMN ticket_channel INTEGER",
                 "ALTER TABLE reports ADD COLUMN deleted_at TEXT",
                 "ALTER TABLE reports ADD COLUMN discord_id TEXT",
@@ -215,6 +220,8 @@ class Database:
                 "ALTER TABLE report_panels ADD COLUMN claim_enabled INTEGER NOT NULL DEFAULT 1",
                 "ALTER TABLE report_panels ADD COLUMN delete_enabled INTEGER NOT NULL DEFAULT 1",
                 "ALTER TABLE report_panels ADD COLUMN deny_enabled INTEGER NOT NULL DEFAULT 1",
+                "ALTER TABLE report_panels ADD COLUMN notification_channel_id INTEGER",
+                "ALTER TABLE report_panels ADD COLUMN report_type TEXT NOT NULL DEFAULT 'discord'",
                 "ALTER TABLE reports ADD COLUMN panel_id INTEGER",
                 "ALTER TABLE reports ADD COLUMN action_taken TEXT",
                 "ALTER TABLE reports ADD COLUMN player_id INTEGER",
@@ -245,6 +252,12 @@ class Database:
                     await db.execute(statement)
                 except aiosqlite.OperationalError:
                     pass
+            # Infer the type of older panels so Discord and game report alerts remain separated.
+            await db.execute(
+                "UPDATE report_panels SET report_type='game' "
+                "WHERE LOWER(COALESCE(form_title,'')) LIKE '%game%' "
+                "OR LOWER(COALESCE(username_label,'')) LIKE '%roblox%'"
+            )
             await db.execute("CREATE INDEX IF NOT EXISTS idx_reports_player_id ON reports(guild_id, player_id)")
             await db.commit()
         await self.backfill_player_profiles()
@@ -524,6 +537,17 @@ class Database:
             cur = await db.execute(
                 "SELECT COUNT(*) FROM reports WHERE guild_id=? AND LOWER(TRIM(target_name))=LOWER(TRIM(?))",
                 (guild_id, target_name),
+            )
+            row = await cur.fetchone()
+            return int(row[0] if row else 0)
+
+    async def count_reports_for_target_type(self, guild_id: int, target_name: str, report_type: str) -> int:
+        async with aiosqlite.connect(self.path) as db:
+            cur = await db.execute(
+                "SELECT COUNT(*) FROM reports r LEFT JOIN report_panels p ON p.id=r.panel_id "
+                "WHERE r.guild_id=? AND LOWER(TRIM(r.target_name))=LOWER(TRIM(?)) "
+                "AND COALESCE(p.report_type,'discord')=?",
+                (guild_id, target_name, report_type),
             )
             row = await cur.fetchone()
             return int(row[0] if row else 0)
@@ -866,29 +890,32 @@ class ReportModal(discord.ui.Modal):
                 await conn.commit()
         await db.set_report_message(report_id, submission_channel.id, message.id)
 
-        # Alert staff when the reported-player username reaches two submitted reports.
+        # Alert staff separately for Discord reports and Roblox game reports.
         reported_username = role_values["username"].strip()
         if reported_username and reported_username != "Not supplied":
-            report_count = await db.count_reports_for_target(interaction.guild_id, reported_username)
+            report_type = (self.panel["report_type"] if "report_type" in self.panel.keys() else "discord") or "discord"
+            report_count = await db.count_reports_for_target_type(interaction.guild_id, reported_username, report_type)
             if report_count == 2:
                 settings = await db.settings(interaction.guild_id)
-                alert_channel_id = settings["warn_alert_channel"]
+                column = "game_report_alert_channel" if report_type == "game" else "discord_report_alert_channel"
+                alert_channel_id = settings[column] or settings["warn_alert_channel"]
                 alert_channel = interaction.guild.get_channel(alert_channel_id) if alert_channel_id else None
                 if isinstance(alert_channel, discord.TextChannel):
+                    label = "Game" if report_type == "game" else "Discord"
                     alert = discord.Embed(
-                        title="⚠️ Repeat Player Report Alert",
+                        title=f"⚠️ Repeat {label} Report Alert",
                         description=(
-                            f"**{reported_username}** has now appeared as the reported player in **2 submitted reports**. "
-                            "Staff should review both reports before deciding on further action."
+                            f"**{reported_username}** has now appeared in **2 {label.lower()} report submissions**. "
+                            "Staff should review the report history before deciding on further action."
                         ),
                         color=0xE74C3C,
                         timestamp=discord.utils.utcnow(),
                     )
                     alert.add_field(name="Latest report", value=f"[Report #{report_id}]({message.jump_url})", inline=True)
-                    alert.add_field(name="Total reports", value=str(report_count), inline=True)
+                    alert.add_field(name=f"{label} report count", value=str(report_count), inline=True)
                     alert.add_field(name="Submitted by", value=interaction.user.mention, inline=True)
                     alert.add_field(name="Source panel", value=f"Panel #{self.panel_id}", inline=True)
-                    alert.set_footer(text="Reported-player names are matched without case sensitivity and surrounding spaces.")
+                    alert.set_footer(text="Discord and game report counts are tracked separately.")
                     await alert_channel.send(embed=alert)
 
         await interaction.followup.send(f"Your report was submitted successfully. Tracking number: **#{report_id}**", ephemeral=True)
@@ -1007,6 +1034,30 @@ async def resolve_report_from_interaction(interaction: discord.Interaction):
     return None
 
 
+async def send_ticket_action_notification(
+    guild: discord.Guild, panel, row, action: str, staff: discord.Member,
+    reason: Optional[str] = None, source_message: Optional[discord.Message] = None,
+) -> None:
+    if not panel or "notification_channel_id" not in panel.keys() or not panel["notification_channel_id"]:
+        return
+    channel = guild.get_channel(int(panel["notification_channel_id"]))
+    if not isinstance(channel, discord.TextChannel):
+        return
+    color = discord.Color.blue() if action == "Claimed" else discord.Color.red()
+    embed = discord.Embed(
+        title=f"Report #{row['id']} {action}",
+        color=color, timestamp=discord.utils.utcnow(),
+    )
+    embed.add_field(name="Reported player", value=row["target_name"] or "Not supplied", inline=True)
+    embed.add_field(name="Handled by", value=staff.mention, inline=True)
+    embed.add_field(name="Source panel", value=f"Panel #{row['panel_id']}" if row["panel_id"] else "Unknown", inline=True)
+    if reason:
+        embed.add_field(name="Denial reason", value=reason[:1024], inline=False)
+    if source_message:
+        embed.add_field(name="Submission", value=f"[Open report]({source_message.jump_url})", inline=False)
+    await channel.send(embed=embed)
+
+
 class TicketControlsView(discord.ui.View):
     def __init__(self, bot: "ReportBot", claimed: bool = False, claim_enabled: bool = True, delete_enabled: bool = True, deny_enabled: bool = True):
         super().__init__(timeout=None)
@@ -1051,6 +1102,9 @@ class TicketControlsView(discord.ui.View):
         delete_enabled = bool(panel["delete_enabled"]) if panel else True
         controls = TicketControlsView(self.bot, claimed=True, claim_enabled=claim_enabled, delete_enabled=delete_enabled, deny_enabled=bool(panel["deny_enabled"]) if panel else True)
         await interaction.response.edit_message(embed=embed, view=controls if controls.children else None)
+        await send_ticket_action_notification(
+            interaction.guild, panel, row, "Claimed", interaction.user, source_message=interaction.message
+        )
         await interaction.followup.send(f"Ticket claimed by {interaction.user.mention}.")
 
     @discord.ui.button(
@@ -1131,6 +1185,9 @@ class DenyReportModal(discord.ui.Modal, title="Deny Report"):
             deny_enabled=False,
         )
         await interaction.response.edit_message(embed=embed, view=view if view.children else None)
+        await send_ticket_action_notification(
+            interaction.guild, panel, row, "Denied", interaction.user, reason=reason, source_message=message
+        )
         await interaction.followup.send(f"Report **#{self.report_id}** was denied.", ephemeral=True)
 
 
@@ -1457,13 +1514,14 @@ class FormEditorView(discord.ui.View):
 
 
 class PanelCustomizeModal(discord.ui.Modal):
-    def __init__(self, bot: "ReportBot", *, mode: str, panel_name: str = "", channel: Optional[discord.TextChannel] = None, submission_channel: Optional[discord.TextChannel] = None, panel=None, claim_enabled: bool = True, delete_enabled: bool = True, deny_enabled: bool = True, form_preset: str = "discord"):
+    def __init__(self, bot: "ReportBot", *, mode: str, panel_name: str = "", channel: Optional[discord.TextChannel] = None, submission_channel: Optional[discord.TextChannel] = None, notification_channel: Optional[discord.TextChannel] = None, panel=None, claim_enabled: bool = True, delete_enabled: bool = True, deny_enabled: bool = True, form_preset: str = "discord"):
         super().__init__(title="Create Report Panel" if mode == "create" else f"Edit Panel #{panel['id']}", timeout=600)
         self.bot = bot
         self.mode = mode
         self.panel_name = panel_name
         self.channel = channel
         self.submission_channel = submission_channel
+        self.notification_channel = notification_channel
         self.panel = panel
         self.claim_enabled = claim_enabled
         self.delete_enabled = delete_enabled
@@ -1503,6 +1561,11 @@ class PanelCustomizeModal(discord.ui.Modal):
                 panel_id = await db.create_panel(interaction.guild_id, self.panel_name, self.channel.id, self.submission_channel.id, title, description, button_text, footer, color, interaction.user.id, self.claim_enabled, self.delete_enabled, self.deny_enabled)
             except aiosqlite.IntegrityError:
                 return await interaction.followup.send("A panel with that name already exists. Choose another name.", ephemeral=True)
+            await db.update_panel(
+                interaction.guild_id, panel_id,
+                report_type=self.form_preset,
+                notification_channel_id=(self.notification_channel.id if self.notification_channel else None),
+            )
             if self.form_preset == "game":
                 await db.update_panel(
                     interaction.guild_id,
@@ -1613,13 +1676,25 @@ async def setup_logs(interaction: discord.Interaction):
     await interaction.followup.send("The warning log and private report ticket system are configured.", ephemeral=True)
 
 
-@setup.command(name="report-alert", description="Choose where duplicate-player report alerts are sent")
-@app_commands.describe(channel="Private staff channel that receives alerts when a reported username reaches two reports")
+@setup.command(name="report-alert", description="Choose separate repeat-report alert channels")
+@app_commands.describe(
+    report_type="Choose whether this channel receives Discord-report or Game-report alerts",
+    channel="Private staff channel that receives the selected alert type",
+)
+@app_commands.choices(report_type=[
+    app_commands.Choice(name="Discord Report Alert", value="discord"),
+    app_commands.Choice(name="Game Report Alert", value="game"),
+])
 @app_commands.checks.has_permissions(administrator=True)
-async def setup_report_alert(interaction: discord.Interaction, channel: discord.TextChannel):
-    await db.update_settings(interaction.guild_id, warn_alert_channel=channel.id)
+async def setup_report_alert(
+    interaction: discord.Interaction, report_type: app_commands.Choice[str], channel: discord.TextChannel
+):
+    column = "game_report_alert_channel" if report_type.value == "game" else "discord_report_alert_channel"
+    await db.update_settings(interaction.guild_id, **{column: channel.id})
+    label = "Game" if report_type.value == "game" else "Discord"
     await interaction.response.send_message(
-        f"Repeat-report alerts will be sent to {channel.mention}. The bot counts the reported-player username from submitted forms and alerts when that name reaches exactly **2 reports**.",
+        f"**{label} repeat-report alerts** will be sent only to {channel.mention}. "
+        f"They trigger when the same reported username reaches exactly **2 {label.lower()} reports**.",
         ephemeral=True,
     )
 
@@ -1824,6 +1899,7 @@ async def warn(
     name="A unique name used to manage this panel",
     panel_channel="Channel where the report panel will be posted",
     submission_channel="Private staff channel where submitted reports will be sent",
+    notification_channel="Optional channel for Claim and Deny notifications",
     preset="Choose the starting form: Discord Report or Game Report",
     claim_button="Show the Claim Ticket button on submissions",
     deny_button="Show the Deny Report button on submissions",
@@ -1839,6 +1915,7 @@ async def report_create_panel(
     name: str,
     panel_channel: discord.TextChannel,
     submission_channel: discord.TextChannel,
+    notification_channel: Optional[discord.TextChannel] = None,
     preset: Optional[app_commands.Choice[str]] = None,
     claim_button: bool = True,
     deny_button: bool = True,
@@ -1854,6 +1931,7 @@ async def report_create_panel(
         panel_name=clean_name,
         channel=panel_channel,
         submission_channel=submission_channel,
+        notification_channel=notification_channel,
         claim_enabled=claim_button,
         delete_enabled=delete_button,
         deny_enabled=deny_button,
@@ -1888,16 +1966,28 @@ async def report_move_panel(interaction: discord.Interaction, panel_id: int, cha
     await db.set_panel_message(panel_id, channel.id, message.id)
     await interaction.response.send_message(f"Panel **#{panel_id}** moved to {channel.mention}.", ephemeral=True)
 
-@report.command(name="set-submission-channel", description="Choose where a panel sends submitted reports")
-@app_commands.describe(panel_id="Panel ID from /report panels", channel="Staff channel that receives submissions")
+@report.command(name="set-submission-channel", description="Set a panel's submission and staff-notification channels")
+@app_commands.describe(
+    panel_id="Panel ID from /report panels",
+    channel="Staff channel that receives full report submissions",
+    notification_channel="Optional separate channel for Claim and Deny notifications",
+)
 @app_commands.checks.has_permissions(administrator=True)
-async def report_set_submission_channel(interaction: discord.Interaction, panel_id: int, channel: discord.TextChannel):
+async def report_set_submission_channel(
+    interaction: discord.Interaction, panel_id: int, channel: discord.TextChannel,
+    notification_channel: Optional[discord.TextChannel] = None,
+):
     panel = await db.panel(interaction.guild_id, panel_id)
     if not panel:
         return await interaction.response.send_message("Panel not found.", ephemeral=True)
-    await db.update_panel(interaction.guild_id, panel_id, submission_channel_id=channel.id)
+    await db.update_panel(
+        interaction.guild_id, panel_id, submission_channel_id=channel.id,
+        notification_channel_id=(notification_channel.id if notification_channel else None),
+    )
+    notification_text = notification_channel.mention if notification_channel else "Disabled"
     await interaction.response.send_message(
-        f"Panel **#{panel_id}** will now send submissions to {channel.mention}.", ephemeral=True
+        f"Panel **#{panel_id}** submissions: {channel.mention}\nClaim/Deny notifications: **{notification_text}**",
+        ephemeral=True,
     )
 
 @report.command(name="form-slots", description="List all removable form slots for one panel")
@@ -2157,8 +2247,12 @@ async def report_panels(interaction: discord.Interaction):
         claim_text = "ON" if row["claim_enabled"] else "OFF"
         deny_text = "ON" if row["deny_enabled"] else "OFF"
         delete_text = "ON" if row["delete_enabled"] else "OFF"
+        notification = interaction.guild.get_channel(row["notification_channel_id"]) if row["notification_channel_id"] else None
+        notification_text = notification.mention if isinstance(notification, discord.TextChannel) else "Disabled"
+        report_type_text = str(row["report_type"] or "discord").title()
         lines.append(
             f"**#{row['id']} — {row['name']}**\nPanel: {location} • Submissions: {destination_text}\n"
+            f"Action notifications: {notification_text} • Type: **{report_type_text}**\n"
             f"Claim: **{claim_text}** • Deny: **{deny_text}** • Delete: **{delete_text}**\nForm: **{row['form_title']}**"
         )
     embed = discord.Embed(title="Saved Report Panels", description="\n".join(lines), color=0x5865F2)
@@ -2380,7 +2474,7 @@ async def help_command(interaction: discord.Interaction):
     setup_embed.description = (
         "**`/setup logs`** — **Administrator**\n"
         "Creates or connects the private warning log and report-ticket channels.\n\n"
-        "**`/setup report-alert channel`** — **Administrator**\n"
+        "**`/setup report-alert report_type channel`** — **Administrator**\n"
         "Chooses the staff channel that receives an alert when one player reaches exactly two warnings.\n\n"
         "**`/setup add-staff-role role`** — **Administrator**\n"
         "Allows a role to claim and delete tickets globally.\n\n"
@@ -2400,7 +2494,7 @@ async def help_command(interaction: discord.Interaction):
         "**`/report panels`** — Lists every saved panel, its panel ID, display channel, and submission channel.\n\n"
         "**`/report edit-panel panel_id`** — Changes a panel's title, description, button text, footer, and color.\n\n"
         "**`/report move-panel panel_id channel`** — Moves one panel message to another channel without changing its submission destination.\n\n"
-        "**`/report set-submission-channel panel_id channel`** — Changes where forms from one panel are delivered.\n\n"
+        "**`/report set-submission-channel panel_id channel notification_channel`** — Sets where full forms are delivered and where Claim/Deny notifications are posted.\n\n"
         "**`/report set-ticket-controls`** — Turns Claim and Delete buttons on or off for one panel; it can also update active submissions.\n\n"
         "**`/report add-panel-staff-role panel_id role`** — Adds an authorized role for one panel only.\n\n"
         "**`/report remove-panel-staff-role panel_id role`** — Removes a panel-specific role.\n\n"
