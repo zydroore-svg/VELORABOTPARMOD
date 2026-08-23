@@ -59,6 +59,8 @@ class Database:
                     panel_channel INTEGER, panel_message INTEGER,
                     ticket_category INTEGER, warn_alert_channel INTEGER,
                     discord_report_alert_channel INTEGER, game_report_alert_channel INTEGER,
+                    discord_report_alert_enabled INTEGER NOT NULL DEFAULT 1, game_report_alert_enabled INTEGER NOT NULL DEFAULT 1,
+                    report_archive_channel INTEGER, report_threads_enabled INTEGER NOT NULL DEFAULT 0,
                     panel_title TEXT DEFAULT 'Discord Report Center',
                     panel_description TEXT DEFAULT 'Press File Report to submit a private Discord user report with image or video evidence.',
                     panel_button TEXT DEFAULT 'File Report',
@@ -92,7 +94,8 @@ class Database:
                     ticket_channel INTEGER, panel_id INTEGER, deleted_at TEXT,
                     created_at TEXT DEFAULT CURRENT_TIMESTAMP,
                     updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
-                    action_taken TEXT, player_id INTEGER
+                    action_taken TEXT, player_id INTEGER,
+                    archive_thread_id INTEGER, archive_index_message INTEGER
                 );
                 CREATE TABLE IF NOT EXISTS player_profiles (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -100,7 +103,8 @@ class Database:
                     canonical_name TEXT NOT NULL,
                     discord_id TEXT,
                     created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+                    updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                    archive_thread_id INTEGER, archive_index_message INTEGER
                 );
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_player_profiles_discord_id
                     ON player_profiles(guild_id, discord_id) WHERE discord_id IS NOT NULL AND discord_id != '';
@@ -213,6 +217,10 @@ class Database:
                 "ALTER TABLE settings ADD COLUMN warn_alert_channel INTEGER",
                 "ALTER TABLE settings ADD COLUMN discord_report_alert_channel INTEGER",
                 "ALTER TABLE settings ADD COLUMN game_report_alert_channel INTEGER",
+                "ALTER TABLE settings ADD COLUMN discord_report_alert_enabled INTEGER NOT NULL DEFAULT 1",
+                "ALTER TABLE settings ADD COLUMN game_report_alert_enabled INTEGER NOT NULL DEFAULT 1",
+                "ALTER TABLE settings ADD COLUMN report_archive_channel INTEGER",
+                "ALTER TABLE settings ADD COLUMN report_threads_enabled INTEGER NOT NULL DEFAULT 0",
                 "ALTER TABLE reports ADD COLUMN ticket_channel INTEGER",
                 "ALTER TABLE reports ADD COLUMN deleted_at TEXT",
                 "ALTER TABLE reports ADD COLUMN discord_id TEXT",
@@ -225,6 +233,10 @@ class Database:
                 "ALTER TABLE reports ADD COLUMN panel_id INTEGER",
                 "ALTER TABLE reports ADD COLUMN action_taken TEXT",
                 "ALTER TABLE reports ADD COLUMN player_id INTEGER",
+                "ALTER TABLE reports ADD COLUMN archive_thread_id INTEGER",
+                "ALTER TABLE reports ADD COLUMN archive_index_message INTEGER",
+                "ALTER TABLE player_profiles ADD COLUMN archive_thread_id INTEGER",
+                "ALTER TABLE player_profiles ADD COLUMN archive_index_message INTEGER",
                 "ALTER TABLE report_panels ADD COLUMN form_title TEXT NOT NULL DEFAULT 'File a Discord Report'",
                 "ALTER TABLE report_panels ADD COLUMN username_label TEXT NOT NULL DEFAULT 'Discord Username'",
                 "ALTER TABLE report_panels ADD COLUMN username_description TEXT NOT NULL DEFAULT 'Enter the reported user name.'",
@@ -615,6 +627,104 @@ class Database:
             )
             return await cur.fetchall()
 
+    async def archive_report_data(self, guild_id: int, report_id: int):
+        async with aiosqlite.connect(self.path) as conn:
+            conn.row_factory = aiosqlite.Row
+            cur = await conn.execute(
+                "SELECT r.*, p.name AS panel_name, p.report_type AS report_type "
+                "FROM reports r LEFT JOIN report_panels p ON p.id=r.panel_id "
+                "WHERE r.guild_id=? AND r.id=?",
+                (guild_id, report_id),
+            )
+            report = await cur.fetchone()
+            if not report:
+                return None, [], []
+            cur = await conn.execute(
+                "SELECT label,value,position FROM report_field_values WHERE report_id=? ORDER BY position,id",
+                (report_id,),
+            )
+            fields = await cur.fetchall()
+            cur = await conn.execute(
+                "SELECT filename,url,content_type,size FROM evidence WHERE report_id=? ORDER BY id",
+                (report_id,),
+            )
+            evidence = await cur.fetchall()
+            return report, fields, evidence
+
+    async def unarchived_reports(self, guild_id: int, limit: int = 50):
+        async with aiosqlite.connect(self.path) as conn:
+            conn.row_factory = aiosqlite.Row
+            cur = await conn.execute(
+                "SELECT r.id FROM reports r LEFT JOIN player_profiles p ON p.id=r.player_id "
+                "WHERE r.guild_id=? AND (r.archive_thread_id IS NULL OR p.archive_thread_id IS NULL OR r.archive_thread_id != p.archive_thread_id) "
+                "ORDER BY r.id ASC LIMIT ?",
+                (guild_id, max(1, min(100, int(limit)))),
+            )
+            return [int(row["id"]) for row in await cur.fetchall()]
+
+    async def set_archive_thread(self, guild_id: int, report_id: int, thread_id: int, index_message_id: int) -> None:
+        async with aiosqlite.connect(self.path) as conn:
+            await conn.execute(
+                "UPDATE reports SET archive_thread_id=?,archive_index_message=?,updated_at=CURRENT_TIMESTAMP WHERE guild_id=? AND id=?",
+                (thread_id, index_message_id, guild_id, report_id),
+            )
+            await conn.commit()
+
+    async def archive_counts(self, guild_id: int) -> tuple[int, int]:
+        async with aiosqlite.connect(self.path) as conn:
+            cur = await conn.execute(
+                "SELECT COUNT(r.id), SUM(CASE WHEN r.archive_thread_id IS NOT NULL AND p.archive_thread_id IS NOT NULL AND r.archive_thread_id=p.archive_thread_id THEN 1 ELSE 0 END) "
+                "FROM reports r LEFT JOIN player_profiles p ON p.id=r.player_id WHERE r.guild_id=?",
+                (guild_id,),
+            )
+            row = await cur.fetchone()
+            return int(row[0] or 0), int(row[1] or 0)
+
+    async def player_archive_profile(self, guild_id: int, player_id: int):
+        async with aiosqlite.connect(self.path) as conn:
+            conn.row_factory = aiosqlite.Row
+            cur = await conn.execute(
+                "SELECT * FROM player_profiles WHERE guild_id=? AND id=?",
+                (guild_id, player_id),
+            )
+            return await cur.fetchone()
+
+    async def set_player_archive_thread(self, guild_id: int, player_id: int, thread_id: int, index_message_id: int) -> None:
+        async with aiosqlite.connect(self.path) as conn:
+            await conn.execute(
+                "UPDATE player_profiles SET archive_thread_id=?,archive_index_message=?,updated_at=CURRENT_TIMESTAMP WHERE guild_id=? AND id=?",
+                (thread_id, index_message_id, guild_id, player_id),
+            )
+            await conn.commit()
+
+    async def player_report_stats(self, guild_id: int, player_id: int):
+        async with aiosqlite.connect(self.path) as conn:
+            conn.row_factory = aiosqlite.Row
+            cur = await conn.execute(
+                "SELECT COUNT(*) AS total, "
+                "SUM(CASE WHEN LOWER(COALESCE(action_taken,''))='warn' THEN 1 ELSE 0 END) AS warns, "
+                "SUM(CASE WHEN LOWER(COALESCE(action_taken,''))='kick' THEN 1 ELSE 0 END) AS kicks, "
+                "SUM(CASE WHEN LOWER(COALESCE(action_taken,''))='ban' THEN 1 ELSE 0 END) AS bans, "
+                "SUM(CASE WHEN LOWER(COALESCE(action_taken,''))='timeout' THEN 1 ELSE 0 END) AS timeouts "
+                "FROM reports WHERE guild_id=? AND player_id=?",
+                (guild_id, player_id),
+            )
+            row = await cur.fetchone()
+            return {k:int(row[k] or 0) for k in ("total","warns","kicks","bans","timeouts")}
+
+    async def players_with_two_warns(self, guild_id: int):
+        async with aiosqlite.connect(self.path) as conn:
+            conn.row_factory = aiosqlite.Row
+            cur = await conn.execute(
+                "SELECT p.id,p.canonical_name,p.archive_thread_id, "
+                "SUM(CASE WHEN LOWER(COALESCE(r.action_taken,''))='warn' THEN 1 ELSE 0 END) AS warns, "
+                "COUNT(r.id) AS total "
+                "FROM player_profiles p LEFT JOIN reports r ON r.player_id=p.id AND r.guild_id=p.guild_id "
+                "WHERE p.guild_id=? GROUP BY p.id HAVING warns>=2 ORDER BY warns DESC,p.canonical_name",
+                (guild_id,),
+            )
+            return await cur.fetchall()
+
     async def add_staff_role(self, guild_id: int, role_id: int, added_by: int) -> None:
         async with aiosqlite.connect(self.path) as conn:
             await conn.execute(
@@ -817,6 +927,156 @@ def mod_embed(case_id: int, kind: str, target: str, moderator: discord.abc.User,
     return e
 
 
+def _archive_thread_name(report) -> str:
+    username = (report["target_name"] or "unknown").strip()
+    username = re.sub(r"[^A-Za-z0-9_.-]+", "-", username).strip("-") or "unknown"
+    status = re.sub(r"[^A-Za-z0-9]+", "-", (report["status"] or "Open")).strip("-")
+    return f"report-{report['id']}-{username}-{status}"[:100]
+
+
+def build_archive_embed(report, fields, evidence) -> discord.Embed:
+    report_type = "Game" if (report["report_type"] or "discord") == "game" else "Discord"
+    embed = discord.Embed(
+        title=f"{report_type} Report Archive • #{report['id']}",
+        color=0x5865F2,
+    )
+    embed.add_field(name="Reported User", value=(report["target_name"] or "Not supplied")[:1024], inline=False)
+    embed.add_field(name="Status", value=report["status"] or "Open", inline=True)
+    embed.add_field(name="Action", value=(report["action_taken"] or "Pending").title(), inline=True)
+    embed.add_field(name="Reporter", value=f"<@{report['reporter_id']}>", inline=True)
+    if not fields:
+        embed.add_field(name="Rules Broken", value=(report["category"] or "Not supplied")[:1024], inline=False)
+        embed.add_field(name="Context", value=(report["details"] or "Not supplied")[:1024], inline=False)
+    for field in fields[:15]:
+        label = (field["label"] or "Field")[:256]
+        value = (field["value"] or "Not supplied")[:1024]
+        if label.casefold() in {"discord username", "roblox username"} and value.casefold() == (report["target_name"] or "").casefold():
+            continue
+        embed.add_field(name=label, value=value, inline=False)
+    if evidence:
+        links = []
+        for i, item in enumerate(evidence[:10], 1):
+            links.append(f"[{i}. {item['filename'][:70]}]({item['url']})")
+        embed.add_field(name=f"Evidence ({len(evidence)})", value="\n".join(links)[:1024], inline=False)
+    else:
+        embed.add_field(name="Evidence", value="No evidence submitted.", inline=False)
+    if report["log_channel"] and report["log_message"]:
+        jump = f"https://discord.com/channels/{report['guild_id']}/{report['log_channel']}/{report['log_message']}"
+        embed.add_field(name="Original Submission", value=f"[Open original report]({jump})", inline=False)
+    embed.set_footer(text=f"Panel: {report['panel_name'] or 'Unknown'} • Created: {report['created_at']}")
+    return embed
+
+
+async def _get_player_thread(guild: discord.Guild, player_id: int):
+    profile = await db.player_archive_profile(guild.id, player_id)
+    if not profile or not profile["archive_thread_id"]:
+        return None
+    thread = guild.get_thread(int(profile["archive_thread_id"]))
+    if thread:
+        return thread
+    try:
+        fetched = await guild.fetch_channel(int(profile["archive_thread_id"]))
+        return fetched if isinstance(fetched, discord.Thread) else None
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+        return None
+
+
+async def refresh_player_thread(guild: discord.Guild, player_id: int) -> None:
+    profile = await db.player_archive_profile(guild.id, player_id)
+    if not profile:
+        return
+    thread = await _get_player_thread(guild, player_id)
+    stats = await db.player_report_stats(guild.id, player_id)
+    if thread:
+        prefix = "⚠️ 2-WARN" if stats["warns"] >= 2 else (f"{stats['warns']}W" if stats["warns"] else "0W")
+        name = f"{prefix} • {profile['canonical_name']}"[:100]
+        try:
+            if thread.name != name:
+                await thread.edit(name=name)
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+    channel_id = (await db.settings(guild.id))["report_archive_channel"]
+    channel = guild.get_channel(channel_id) if channel_id else None
+    if isinstance(channel, discord.TextChannel) and profile["archive_index_message"]:
+        try:
+            msg = await channel.fetch_message(int(profile["archive_index_message"]))
+            embed = discord.Embed(
+                title=("⚠️ TWO OR MORE WARNINGS • " if stats["warns"] >= 2 else "Player Report Archive • ") + profile["canonical_name"],
+                description=(
+                    f"**Warns:** {stats['warns']}  •  **Kicks:** {stats['kicks']}  •  **Timeouts:** {stats['timeouts']}  •  **Bans:** {stats['bans']}\n"
+                    f"**Total reports:** {stats['total']}\n\nOpen the thread to view every old and new report, rules broken, evidence, and staff actions."
+                ),
+                color=0xE74C3C if stats["warns"] >= 2 else 0x2B2D31,
+            )
+            await msg.edit(embed=embed)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            pass
+
+
+async def archive_report_to_thread(guild: discord.Guild, report_id: int, *, force: bool = False):
+    settings = await db.settings(guild.id)
+    if not force and not bool(settings["report_threads_enabled"]):
+        return None
+    channel_id = settings["report_archive_channel"]
+    channel = guild.get_channel(channel_id) if channel_id else None
+    if not isinstance(channel, discord.TextChannel):
+        return None
+    report, fields, evidence = await db.archive_report_data(guild.id, report_id)
+    if not report or not report["player_id"]:
+        return None
+    player_id = int(report["player_id"])
+    profile = await db.player_archive_profile(guild.id, player_id)
+    if not profile:
+        return None
+    thread = await _get_player_thread(guild, player_id)
+    if thread is None:
+        stats = await db.player_report_stats(guild.id, player_id)
+        starter_embed = discord.Embed(
+            title=f"Player Report Archive • {profile['canonical_name']}",
+            description=(
+                f"**Warns:** {stats['warns']}  •  **Kicks:** {stats['kicks']}  •  **Timeouts:** {stats['timeouts']}  •  **Bans:** {stats['bans']}\n"
+                f"**Total reports:** {stats['total']}\n\nAll existing and future reports for this player are compiled in the thread below."
+            ),
+            color=0xE74C3C if stats["warns"] >= 2 else 0x2B2D31,
+        )
+        starter = await channel.send(embed=starter_embed)
+        prefix = "⚠️ 2-WARN" if stats["warns"] >= 2 else (f"{stats['warns']}W" if stats["warns"] else "0W")
+        thread = await starter.create_thread(name=f"{prefix} • {profile['canonical_name']}"[:100], auto_archive_duration=10080)
+        await db.set_player_archive_thread(guild.id, player_id, thread.id, starter.id)
+    if thread.archived:
+        try:
+            await thread.edit(archived=False)
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+    # Do not duplicate a report already compiled into this player thread.
+    if not report["archive_thread_id"] or int(report["archive_thread_id"]) != int(thread.id):
+        await thread.send(content=f"**Report #{report_id}**", embed=build_archive_embed(report, fields, evidence))
+        profile = await db.player_archive_profile(guild.id, player_id)
+        await db.set_archive_thread(guild.id, report_id, thread.id, int(profile["archive_index_message"] or 0))
+    await refresh_player_thread(guild, player_id)
+    return thread
+
+
+async def archive_event(guild: discord.Guild, report_id: int, text: str) -> None:
+    report, _, _ = await db.archive_report_data(guild.id, report_id)
+    if not report or not report["archive_thread_id"]:
+        return
+    thread = guild.get_thread(int(report["archive_thread_id"]))
+    if thread is None:
+        try:
+            fetched = await guild.fetch_channel(int(report["archive_thread_id"]))
+            thread = fetched if isinstance(fetched, discord.Thread) else None
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            return
+    if thread:
+        try:
+            if thread.archived:
+                await thread.edit(archived=False)
+            await thread.send(text[:2000])
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+
+
 class ReportModal(discord.ui.Modal):
     def __init__(self, bot: "ReportBot", panel, slots):
         super().__init__(title=(panel["form_title"] or "File a Discord Report")[:45], timeout=600)
@@ -889,6 +1149,10 @@ class ReportModal(discord.ui.Modal):
                 await conn.execute("INSERT INTO evidence(report_id,filename,content_type,size,url) VALUES(?,?,?,?,?)", (report_id,uploaded.filename,original.content_type,uploaded.size,uploaded.url))
                 await conn.commit()
         await db.set_report_message(report_id, submission_channel.id, message.id)
+        try:
+            await archive_report_to_thread(interaction.guild, report_id)
+        except (discord.Forbidden, discord.HTTPException):
+            pass
 
         # Alert staff separately for Discord reports and Roblox game reports.
         reported_username = role_values["username"].strip()
@@ -898,9 +1162,10 @@ class ReportModal(discord.ui.Modal):
             if report_count == 2:
                 settings = await db.settings(interaction.guild_id)
                 column = "game_report_alert_channel" if report_type == "game" else "discord_report_alert_channel"
+                enabled_column = "game_report_alert_enabled" if report_type == "game" else "discord_report_alert_enabled"
                 alert_channel_id = settings[column] or settings["warn_alert_channel"]
                 alert_channel = interaction.guild.get_channel(alert_channel_id) if alert_channel_id else None
-                if isinstance(alert_channel, discord.TextChannel):
+                if bool(settings[enabled_column]) and isinstance(alert_channel, discord.TextChannel):
                     label = "Game" if report_type == "game" else "Discord"
                     alert = discord.Embed(
                         title=f"⚠️ Repeat {label} Report Alert",
@@ -1105,6 +1370,7 @@ class TicketControlsView(discord.ui.View):
         await send_ticket_action_notification(
             interaction.guild, panel, row, "Claimed", interaction.user, source_message=interaction.message
         )
+        await archive_event(interaction.guild, row["id"], f"✋ **Claimed** by {interaction.user.mention}.")
 
     @discord.ui.button(
         label="Deny Report", style=discord.ButtonStyle.secondary, emoji="⛔",
@@ -1187,6 +1453,7 @@ class DenyReportModal(discord.ui.Modal, title="Deny Report"):
         await send_ticket_action_notification(
             interaction.guild, panel, row, "Denied", interaction.user, reason=reason, source_message=message
         )
+        await archive_event(interaction.guild, self.report_id, f"⛔ **Denied** by {interaction.user.mention}.\n**Reason:** {reason}")
         await interaction.followup.send(f"Report **#{self.report_id}** was denied.", ephemeral=True)
 
 
@@ -1646,6 +1913,7 @@ setup = app_commands.Group(name="setup", description="Configure bot log channels
 report = app_commands.Group(name="report", description="Submit and manage reports")
 tracker = app_commands.Group(name="tracker", description="View moderation and report totals")
 track = app_commands.Group(name="track", description="View a person's complete moderation history")
+archive = app_commands.Group(name="archive", description="Compile and browse reports in Discord threads")
 
 
 @setup.command(name="logs", description="Create or connect all private log channels")
@@ -1697,6 +1965,34 @@ async def setup_report_alert(
         ephemeral=True,
     )
 
+
+
+@setup.command(name="report-alert-toggle", description="Turn Discord/Game repeat-report alerts on or off")
+@app_commands.describe(
+    report_type="Which alert system to change",
+    enabled="True to enable alerts, False to disable them",
+)
+@app_commands.choices(report_type=[
+    app_commands.Choice(name="Discord Report Alerts", value="discord"),
+    app_commands.Choice(name="Game Report Alerts", value="game"),
+    app_commands.Choice(name="Both Discord + Game", value="all"),
+])
+@app_commands.checks.has_permissions(administrator=True)
+async def setup_report_alert_toggle(
+    interaction: discord.Interaction, report_type: app_commands.Choice[str], enabled: bool
+):
+    updates = {}
+    if report_type.value in ("discord", "all"):
+        updates["discord_report_alert_enabled"] = int(enabled)
+    if report_type.value in ("game", "all"):
+        updates["game_report_alert_enabled"] = int(enabled)
+    await db.update_settings(interaction.guild_id, **updates)
+    label = {"discord":"Discord report", "game":"Game report", "all":"Discord + Game report"}[report_type.value]
+    await interaction.response.send_message(
+        f"**{label} alerts** are now **{'ON' if enabled else 'OFF'}**. "
+        "Your configured alert channels were kept and can be re-enabled anytime.",
+        ephemeral=True,
+    )
 
 
 @setup.command(name="add-staff-role", description="Allow a role to claim and delete report tickets")
@@ -2308,6 +2604,11 @@ async def report_panel(
 @app_commands.checks.has_permissions(moderate_members=True)
 async def report_set_action(interaction: discord.Interaction, report_id: int, action: app_commands.Choice[str]):
     ok = await db.set_report_action(interaction.guild_id, report_id, action.value)
+    if ok:
+        await archive_event(interaction.guild, report_id, f"🛡️ Moderation action recorded: **{action.value.title()}** by {interaction.user.mention}.")
+        row = await db.report(interaction.guild_id, report_id)
+        if row and row["player_id"]:
+            await refresh_player_thread(interaction.guild, int(row["player_id"]))
     await interaction.response.send_message(
         f"Report **#{report_id}** action set to **{action.name}**." if ok else "Report not found.",
         ephemeral=True,
@@ -2325,6 +2626,8 @@ async def report_view(interaction: discord.Interaction, report_id: int):
 @app_commands.checks.has_permissions(moderate_members=True)
 async def report_update(interaction: discord.Interaction, report_id: int, status: app_commands.Choice[str], note: str=""):
     ok=await db.update_report(interaction.guild_id,report_id,status.value,interaction.user.id,note)
+    if ok:
+        await archive_event(interaction.guild, report_id, f"📝 Status updated to **{status.value}** by {interaction.user.mention}." + (f"\n**Note:** {note}" if note else ""))
     await interaction.response.send_message(f"Report #{report_id} updated to **{status.value}**." if ok else "Report not found.",ephemeral=True)
 
 async def send_player_tracker(interaction: discord.Interaction, username: str):
@@ -2448,6 +2751,96 @@ async def track_add_alias(interaction: discord.Interaction, existing: str, alias
         ephemeral=True,
     )
 
+@archive.command(name="setup", description="Create one searchable report-history thread per player")
+@app_commands.describe(channel="Staff channel that will contain player report-history threads", auto_archive="Automatically add every future report to the player thread")
+@app_commands.checks.has_permissions(administrator=True)
+async def archive_setup(interaction: discord.Interaction, channel: discord.TextChannel, auto_archive: bool = True):
+    await db.update_settings(
+        interaction.guild_id,
+        report_archive_channel=channel.id,
+        report_threads_enabled=int(auto_archive),
+    )
+    await interaction.response.send_message(
+        f"Report archive channel set to {channel.mention}.\nAutomatic thread archiving: **{'ON' if auto_archive else 'OFF'}**.\n"
+        "Use `/archive compile-existing` to compile older reports into the same player threads.",
+        ephemeral=True,
+    )
+
+
+@archive.command(name="compile-existing", description="Compile older saved reports into archive threads")
+@app_commands.describe(limit="Maximum reports to compile in this batch (1-100)")
+@app_commands.checks.has_permissions(administrator=True)
+async def archive_compile_existing(interaction: discord.Interaction, limit: app_commands.Range[int, 1, 100] = 50):
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    settings = await db.settings(interaction.guild_id)
+    channel = interaction.guild.get_channel(settings["report_archive_channel"] or 0)
+    if not isinstance(channel, discord.TextChannel):
+        return await interaction.followup.send("Run `/archive setup` first and choose a valid archive channel.", ephemeral=True)
+    ids = await db.unarchived_reports(interaction.guild_id, limit)
+    if not ids:
+        return await interaction.followup.send("All saved reports are already compiled into archive threads.", ephemeral=True)
+    created = 0
+    failed = 0
+    for report_id in ids:
+        try:
+            thread = await archive_report_to_thread(interaction.guild, report_id, force=True)
+            if thread:
+                created += 1
+            else:
+                failed += 1
+        except (discord.Forbidden, discord.HTTPException):
+            failed += 1
+        await asyncio.sleep(0.25)
+    total, archived = await db.archive_counts(interaction.guild_id)
+    remaining = max(0, total - archived)
+    await interaction.followup.send(
+        f"Compiled **{created}** report(s) into threads. Failed: **{failed}**. Remaining: **{remaining}**.\n"
+        + ("Run `/archive compile-existing` again to continue." if remaining else "Archive is up to date."),
+        ephemeral=True,
+    )
+
+
+@archive.command(name="status", description="Show report thread archive status")
+@app_commands.checks.has_permissions(moderate_members=True)
+async def archive_status(interaction: discord.Interaction):
+    settings = await db.settings(interaction.guild_id)
+    channel = interaction.guild.get_channel(settings["report_archive_channel"] or 0)
+    total, archived = await db.archive_counts(interaction.guild_id)
+    await interaction.response.send_message(
+        f"**Archive channel:** {channel.mention if isinstance(channel, discord.TextChannel) else 'Not configured'}\n"
+        f"**Automatic future threads:** {'ON' if settings['report_threads_enabled'] else 'OFF'}\n"
+        f"**Archived reports:** {archived}/{total}\n"
+        f"**Remaining:** {max(0, total-archived)}",
+        ephemeral=True,
+    )
+
+
+@archive.command(name="two-warnings", description="Quickly list player threads with two or more warnings")
+@app_commands.checks.has_permissions(moderate_members=True)
+async def archive_two_warnings(interaction: discord.Interaction):
+    rows = await db.players_with_two_warns(interaction.guild_id)
+    if not rows:
+        return await interaction.response.send_message("No tracked player currently has two or more report warnings.", ephemeral=True)
+    lines = []
+    for row in rows[:25]:
+        thread = interaction.guild.get_thread(int(row["archive_thread_id"])) if row["archive_thread_id"] else None
+        if thread is None and row["archive_thread_id"]:
+            try:
+                fetched = await interaction.guild.fetch_channel(int(row["archive_thread_id"]))
+                thread = fetched if isinstance(fetched, discord.Thread) else None
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                thread = None
+        link = thread.mention if isinstance(thread, discord.Thread) else "Thread not compiled yet"
+        lines.append(f"⚠️ **{row['canonical_name']}** — **{int(row['warns'] or 0)} warns** • {int(row['total'] or 0)} reports • {link}")
+    embed = discord.Embed(
+        title="⚠️ Players With 2+ Warnings",
+        description="\n".join(lines),
+        color=0xE74C3C,
+    )
+    embed.set_footer(text="Use /archive compile-existing if an older player's thread has not been compiled yet.")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
 @bot.tree.command(name="help", description="Show explanations and examples for every bot command")
 async def help_command(interaction: discord.Interaction):
     intro = discord.Embed(
@@ -2531,7 +2924,13 @@ async def help_command(interaction: discord.Interaction):
         "**`/tracker user username`** — **Moderator**\n"
         "Alias of `/tracker player`.\n\n"
         "**`/tracker summary`** — **Moderator**\n"
-        "Shows server-wide totals for warnings and report statuses."
+        "Shows server-wide totals for warnings and report statuses.\n\n"
+        "**`/archive setup channel auto_archive`** — **Administrator**\n"
+        "Chooses the staff archive channel and automatically creates one Discord thread per future report.\n\n"
+        "**`/archive compile-existing limit`** — **Administrator**\n"
+        "Compiles older database reports into archive threads in batches of up to 100.\n\n"
+        "**`/archive status`** — **Moderator**\n"
+        "Shows how many reports have already been archived into threads."
     )
     tracking_embed.set_footer(text="Tip: use the same spelling for player names to keep tracker records together.")
 
@@ -2541,6 +2940,7 @@ async def help_command(interaction: discord.Interaction):
 
 bot.tree.add_command(setup); bot.tree.add_command(report); bot.tree.add_command(tracker)
 bot.tree.add_command(track)
+bot.tree.add_command(archive)
 
 @bot.tree.error
 async def tree_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
