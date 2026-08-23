@@ -670,6 +670,26 @@ class Database:
             )
             await conn.commit()
 
+    async def all_report_ids(self, guild_id: int, limit: int = 100):
+        async with aiosqlite.connect(self.path) as conn:
+            cur = await conn.execute(
+                "SELECT id FROM reports WHERE guild_id=? AND status!='Deleted' ORDER BY id ASC LIMIT ?",
+                (guild_id, max(1, min(500, int(limit)))),
+            )
+            return [int(row[0]) for row in await cur.fetchall()]
+
+    async def reset_archive_links(self, guild_id: int) -> None:
+        async with aiosqlite.connect(self.path) as conn:
+            await conn.execute(
+                "UPDATE reports SET archive_thread_id=NULL, archive_index_message=NULL WHERE guild_id=?",
+                (guild_id,),
+            )
+            await conn.execute(
+                "UPDATE player_profiles SET archive_thread_id=NULL, archive_index_message=NULL WHERE guild_id=?",
+                (guild_id,),
+            )
+            await conn.commit()
+
     async def archive_counts(self, guild_id: int) -> tuple[int, int]:
         async with aiosqlite.connect(self.path) as conn:
             cur = await conn.execute(
@@ -2778,7 +2798,25 @@ async def archive_compile_existing(interaction: discord.Interaction, limit: app_
         return await interaction.followup.send("Run `/archive setup` first and choose a valid archive channel.", ephemeral=True)
     ids = await db.unarchived_reports(interaction.guild_id, limit)
     if not ids:
-        return await interaction.followup.send("All saved reports are already compiled into archive threads.", ephemeral=True)
+        # A saved thread ID is not proof that the Discord thread still exists or is in the current archive channel.
+        # Validate player threads and repair stale mappings automatically.
+        candidates = await db.all_report_ids(interaction.guild_id, limit)
+        stale_found = False
+        for report_id in candidates:
+            report, _, _ = await db.archive_report_data(interaction.guild_id, report_id)
+            if not report or not report["player_id"]:
+                continue
+            thread = await _get_player_thread(interaction.guild, int(report["player_id"]))
+            if thread is None or int(getattr(thread, "parent_id", 0) or 0) != int(channel.id):
+                stale_found = True
+                break
+        if not stale_found:
+            return await interaction.followup.send(
+                f"All saved reports are compiled. Player threads are in {channel.mention}. Use `/archive two-warnings` to locate players with 2+ warnings.",
+                ephemeral=True,
+            )
+        await db.reset_archive_links(interaction.guild_id)
+        ids = await db.unarchived_reports(interaction.guild_id, limit)
     created = 0
     failed = 0
     for report_id in ids:
@@ -2796,6 +2834,35 @@ async def archive_compile_existing(interaction: discord.Interaction, limit: app_
     await interaction.followup.send(
         f"Compiled **{created}** report(s) into threads. Failed: **{failed}**. Remaining: **{remaining}**.\n"
         + ("Run `/archive compile-existing` again to continue." if remaining else "Archive is up to date."),
+        ephemeral=True,
+    )
+
+
+@archive.command(name="rebuild", description="Rebuild player threads when old archive mappings are stale")
+@app_commands.describe(limit="Maximum reports to rebuild in this batch (1-100)")
+@app_commands.checks.has_permissions(administrator=True)
+async def archive_rebuild(interaction: discord.Interaction, limit: app_commands.Range[int, 1, 100] = 100):
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    settings = await db.settings(interaction.guild_id)
+    channel = interaction.guild.get_channel(settings["report_archive_channel"] or 0)
+    if not isinstance(channel, discord.TextChannel):
+        return await interaction.followup.send("Run `/archive setup` first and choose the channel where player threads should live.", ephemeral=True)
+    await db.reset_archive_links(interaction.guild_id)
+    ids = await db.unarchived_reports(interaction.guild_id, limit)
+    compiled = failed = 0
+    for report_id in ids:
+        try:
+            if await archive_report_to_thread(interaction.guild, report_id, force=True):
+                compiled += 1
+            else:
+                failed += 1
+        except (discord.Forbidden, discord.HTTPException):
+            failed += 1
+        await asyncio.sleep(0.25)
+    total, archived = await db.archive_counts(interaction.guild_id)
+    await interaction.followup.send(
+        f"Rebuilt **{compiled}** report(s) into player threads in {channel.mention}. Failed: **{failed}**. "
+        f"Archived: **{archived}/{total}**. Run `/archive rebuild` again if more remain.",
         ephemeral=True,
     )
 
