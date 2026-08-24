@@ -877,11 +877,47 @@ class Database:
                     (guild_id, profile["id"]),
                 )
             else:
-                # Compatibility fallback for records not yet migrated.
+                # Compatibility fallback for old/dynamic-form reports. Older reports may have
+                # the player name only in report_field_values (for example a Roblox Username
+                # field) and not in reports.target_name/player_profiles. Scan both locations.
                 wanted = self.normalize_identity(target)
                 cur = await conn.execute("SELECT * FROM reports WHERE guild_id=? ORDER BY id DESC", (guild_id,))
-                rows = await cur.fetchall()
-                reports = [r for r in rows if self.normalize_identity(r["target_name"]) == wanted or self.normalize_identity(r["discord_id"] or "") == wanted]
+                all_reports = await cur.fetchall()
+                matched_ids = {
+                    int(r["id"]) for r in all_reports
+                    if self.normalize_identity(r["target_name"] or "") == wanted
+                    or self.normalize_identity(r["discord_id"] or "") == wanted
+                }
+
+                # First scan identity-like form slots. This is the main path for existing
+                # reports created before player profiles/aliases were introduced.
+                cur = await conn.execute(
+                    "SELECT rfv.report_id,rfv.label,rfv.value,pfs.role "
+                    "FROM report_field_values rfv "
+                    "JOIN reports r ON r.id=rfv.report_id "
+                    "LEFT JOIN panel_form_slots pfs ON pfs.id=rfv.slot_id "
+                    "WHERE r.guild_id=?",
+                    (guild_id,),
+                )
+                field_rows = await cur.fetchall()
+                for fv in field_rows:
+                    role = (fv["role"] or "").strip().lower()
+                    label = (fv["label"] or "").strip().casefold()
+                    identity_field = role in {"username", "discord_id"} or any(
+                        key in label for key in ("username", "user name", "roblox", "player name", "discord id", "user id")
+                    )
+                    if identity_field and self.normalize_identity(fv["value"] or "") == wanted:
+                        matched_ids.add(int(fv["report_id"]))
+
+                # Last-resort exact-value scan for very old customized forms whose slot role
+                # and label were changed/deleted after submission. Exact normalized equality
+                # keeps this from doing substring matches inside Context/Rules fields.
+                if not matched_ids:
+                    for fv in field_rows:
+                        if self.normalize_identity(fv["value"] or "") == wanted:
+                            matched_ids.add(int(fv["report_id"]))
+
+                reports = [r for r in all_reports if int(r["id"]) in matched_ids]
                 report_ids = [r["id"] for r in reports]
                 evidence={}
                 if report_ids:
