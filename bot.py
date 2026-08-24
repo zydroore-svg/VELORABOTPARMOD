@@ -150,6 +150,19 @@ class Database:
                     position INTEGER NOT NULL,
                     FOREIGN KEY(report_id) REFERENCES reports(id) ON DELETE CASCADE
                 );
+                CREATE TABLE IF NOT EXISTS report_search_index (
+                    guild_id INTEGER NOT NULL,
+                    report_number INTEGER NOT NULL,
+                    username_normalized TEXT NOT NULL,
+                    username_display TEXT NOT NULL,
+                    channel_id INTEGER NOT NULL,
+                    message_id INTEGER NOT NULL,
+                    source TEXT NOT NULL DEFAULT 'discord_scan',
+                    updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY(guild_id, channel_id, message_id, username_normalized)
+                );
+                CREATE INDEX IF NOT EXISTS idx_report_search_username
+                    ON report_search_index(guild_id, username_normalized);
                 CREATE TABLE IF NOT EXISTS staff_roles (
                     guild_id INTEGER NOT NULL,
                     role_id INTEGER NOT NULL,
@@ -867,6 +880,35 @@ class Database:
         value = value.lstrip("@").replace(" ", "").replace("_", "")
         return "".join(ch for ch in value if ch.isalnum() or ch in {".", "-"})
 
+    async def index_report_message(self, guild_id: int, report_number: int, username: str, channel_id: int, message_id: int, source: str = "discord_scan") -> None:
+        normalized = self.normalize_identity(username)
+        if not normalized:
+            return
+        async with aiosqlite.connect(self.path) as conn:
+            await conn.execute(
+                "INSERT INTO report_search_index(guild_id,report_number,username_normalized,username_display,channel_id,message_id,source,updated_at) "
+                "VALUES(?,?,?,?,?,?,?,CURRENT_TIMESTAMP) "
+                "ON CONFLICT(guild_id,channel_id,message_id,username_normalized) DO UPDATE SET "
+                "report_number=excluded.report_number,username_display=excluded.username_display,source=excluded.source,updated_at=CURRENT_TIMESTAMP",
+                (guild_id, report_number, normalized, username[:100], channel_id, message_id, source),
+            )
+            await conn.commit()
+
+    async def indexed_reports_for_person(self, guild_id: int, username: str):
+        normalized = self.normalize_identity(username)
+        async with aiosqlite.connect(self.path) as conn:
+            conn.row_factory = aiosqlite.Row
+            cur = await conn.execute(
+                "SELECT * FROM report_search_index WHERE guild_id=? AND username_normalized=? ORDER BY report_number DESC",
+                (guild_id, normalized),
+            )
+            return await cur.fetchall()
+
+    async def clear_report_search_index(self, guild_id: int) -> None:
+        async with aiosqlite.connect(self.path) as conn:
+            await conn.execute("DELETE FROM report_search_index WHERE guild_id=?", (guild_id,))
+            await conn.commit()
+
     async def person_history(self, guild_id: int, target: str):
         profile = await self.resolve_player(guild_id, target, target, False)
         async with aiosqlite.connect(self.path) as conn:
@@ -1175,6 +1217,8 @@ class ReportModal(discord.ui.Modal):
                 await conn.execute("INSERT INTO evidence(report_id,filename,content_type,size,url) VALUES(?,?,?,?,?)", (report_id,uploaded.filename,original.content_type,uploaded.size,uploaded.url))
                 await conn.commit()
         await db.set_report_message(report_id, submission_channel.id, message.id)
+        if role_values["username"].strip() and role_values["username"] != "Not supplied":
+            await db.index_report_message(interaction.guild_id, report_id, role_values["username"], submission_channel.id, message.id, "live_report")
         # Alert staff separately for Discord reports and Roblox game reports.
         reported_username = role_values["username"].strip()
         if reported_username and reported_username != "Not supplied":
@@ -2683,182 +2727,76 @@ async def tracker_summary(interaction: discord.Interaction):
 
 
 
-@track.command(name="person", description="Scan all Discord channels for existing report ticket numbers")
-@app_commands.describe(username="Reported player username to search for across all accessible report channels")
+@track.command(name="person", description="Instantly list indexed report ticket numbers for a player")
+@app_commands.describe(username="Reported player username")
 @app_commands.checks.has_permissions(moderate_members=True)
 async def track_person(interaction: discord.Interaction, username: str):
-    await interaction.response.defer(ephemeral=True, thinking=True)
-
-    guild = interaction.guild
-    if guild is None:
-        return await interaction.followup.send("This command can only be used inside a server.", ephemeral=True)
-
-    def normalize(value: str) -> str:
-        # Case-insensitive exact-ish username comparison while tolerating @ and surrounding whitespace.
-        value = (value or "").strip().lower()
-        if value.startswith("@"):
-            value = value[1:]
-        return value.strip()
-
-    wanted = normalize(username)
-    if not wanted:
-        return await interaction.followup.send("Enter a player username to search for.", ephemeral=True)
-
-    ticket_pattern = re.compile(r"(?:discord\s+report\s+ticket|game\s+report\s+ticket|report\s+ticket|ticket|report)\s*#\s*(\d+)", re.I)
-    username_field_hints = (
-        "username", "roblox username", "discord username", "player", "player name",
-        "reported player", "reported username", "target", "user name",
-    )
-
-    found = {}
-    scanned_channels = 0
-    skipped_channels = 0
-    scanned_messages = 0
-
-    async def inspect_message(message: discord.Message, source_name: str):
-        nonlocal scanned_messages
-        scanned_messages += 1
-        if not message.embeds and not message.content:
-            return
-
-        for embed in message.embeds:
-            title = embed.title or ""
-            match = ticket_pattern.search(title)
-            if not match:
-                # Some older report formats may put the ticket number in the description/content.
-                combined_header = " ".join(filter(None, [title, embed.description or "", message.content or ""]))
-                match = ticket_pattern.search(combined_header)
-            if not match:
-                continue
-
-            # Only accept the message when a username-like report field matches the searched player.
-            matched_username = False
-            matched_value = None
-            for field in embed.fields:
-                field_name = normalize(field.name)
-                if any(hint in field_name for hint in username_field_hints):
-                    raw_value = str(field.value or "").strip()
-                    # Strip simple markdown/code formatting that may exist in older embeds.
-                    cleaned = raw_value.replace("`", "").replace("**", "").strip()
-                    # If the value has an ID/extra text, compare the first visible line as well as full value.
-                    candidates = {normalize(cleaned), normalize(cleaned.splitlines()[0] if cleaned else "")}
-                    if wanted in candidates:
-                        matched_username = True
-                        matched_value = cleaned
-                        break
-
-            if not matched_username:
-                # Fallback for legacy reports where the player name was placed in embed description/content.
-                haystack = "\n".join(filter(None, [embed.description or "", message.content or ""]))
-                for line in haystack.splitlines():
-                    low = normalize(line)
-                    if any(hint in low for hint in username_field_hints) and wanted in low:
-                        matched_username = True
-                        matched_value = username
-                        break
-
-            if not matched_username:
-                continue
-
-            report_no = int(match.group(1))
-            # Keep the newest/live location if duplicates of the same ticket exist.
-            previous = found.get(report_no)
-            record = {
-                "report_no": report_no,
-                "channel_id": message.channel.id,
-                "channel_name": source_name,
-                "message_id": message.id,
-                "jump_url": message.jump_url,
-                "matched_value": matched_value or username,
-                "created_at": message.created_at,
-            }
-            if previous is None or record["created_at"] > previous["created_at"]:
-                found[report_no] = record
-
-    # Scan every normal text channel the bot can read.
-    for channel in guild.text_channels:
-        me = guild.me
-        if me is not None:
-            perms = channel.permissions_for(me)
-            if not (perms.view_channel and perms.read_message_history):
-                skipped_channels += 1
-                continue
-        try:
-            scanned_channels += 1
-            async for message in channel.history(limit=None, oldest_first=False):
-                await inspect_message(message, f"#{channel.name}")
-        except (discord.Forbidden, discord.HTTPException):
-            skipped_channels += 1
-            continue
-
-        # Also scan active threads under each channel when accessible.
-        for thread in list(channel.threads):
-            try:
-                if me is not None:
-                    perms = thread.permissions_for(me)
-                    if not (perms.view_channel and perms.read_message_history):
-                        continue
-                async for message in thread.history(limit=None, oldest_first=False):
-                    await inspect_message(message, f"#{channel.name} / {thread.name}")
-            except (discord.Forbidden, discord.HTTPException):
-                continue
-
-    # Scan archived public threads too, since older reports may have been moved there by previous versions.
-    for channel in guild.text_channels:
-        try:
-            async for thread in channel.archived_threads(limit=None, private=False):
-                try:
-                    async for message in thread.history(limit=None, oldest_first=False):
-                        await inspect_message(message, f"#{channel.name} / {thread.name}")
-                except (discord.Forbidden, discord.HTTPException):
-                    continue
-        except (discord.Forbidden, discord.HTTPException, AttributeError):
-            continue
-
-    if not found:
-        details = f"Scanned **{scanned_channels}** channel(s) and **{scanned_messages:,}** message(s)."
-        if skipped_channels:
-            details += f" **{skipped_channels}** channel(s) were skipped because the bot could not read their history."
-        return await interaction.followup.send(
-            f"No existing report ticket was found for **{username}**.\n{details}\n\n"
-            "Make sure the bot has **View Channel** and **Read Message History** in every report channel.",
+    rows = await db.indexed_reports_for_person(interaction.guild_id, username)
+    if not rows:
+        return await interaction.response.send_message(
+            f"No indexed report tickets were found for **{username}**. Run `/track index-existing` once to import older Discord reports. Future reports are indexed automatically.",
             ephemeral=True,
         )
+    lines=[]
+    seen=set()
+    for row in rows:
+        key=(row["channel_id"],row["message_id"])
+        if key in seen:
+            continue
+        seen.add(key)
+        url=f"https://discord.com/channels/{interaction.guild_id}/{row['channel_id']}/{row['message_id']}"
+        ch=interaction.guild.get_channel(row["channel_id"]) if interaction.guild else None
+        cname=f"#{ch.name}" if isinstance(ch, discord.TextChannel) else "saved channel"
+        lines.append(f"• [Report Ticket #{row['report_number']}]({url}) — {cname}")
+    embed=discord.Embed(title=f"Existing Report Tickets • {username}", description="\n".join(lines[:40]), color=0x5865F2)
+    embed.set_footer(text=f"{len(lines)} matching report ticket(s) • indexed lookup")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
-    records = sorted(found.values(), key=lambda r: r["report_no"], reverse=True)
-    lines = [
-        f"• [Report Ticket #{r['report_no']}]({r['jump_url']}) — {r['channel_name']}"
-        for r in records
-    ]
 
-    # Split safely across embeds when a player has many reports.
-    chunks = []
-    current = []
-    current_len = 0
-    for line in lines:
-        if current and current_len + len(line) + 1 > 3500:
-            chunks.append(current)
-            current = []
-            current_len = 0
-        current.append(line)
-        current_len += len(line) + 1
-    if current:
-        chunks.append(current)
+@track.command(name="index-existing", description="Scan old Discord report messages once and build a fast tracker index")
+@app_commands.describe(reset="Clear the old index first and rebuild it")
+@app_commands.checks.has_permissions(administrator=True)
+async def track_index_existing(interaction: discord.Interaction, reset: bool = False):
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    guild=interaction.guild
+    if guild is None:
+        return await interaction.followup.send("This command can only be used in a server.", ephemeral=True)
+    if reset:
+        await db.clear_report_search_index(interaction.guild_id)
+    ticket_pattern = re.compile(r"(?:discord\s+report\s+ticket|game\s+report\s+ticket|report\s+ticket|ticket|report)\s*#\s*(\d+)", re.I)
+    username_hints=("username","roblox username","discord username","player","player name","reported player","reported username","target","user name")
+    scanned=0; indexed=0; skipped=0
+    for channel in guild.text_channels:
+        perms=channel.permissions_for(guild.me) if guild.me else None
+        if perms and (not perms.view_channel or not perms.read_message_history):
+            skipped+=1; continue
+        try:
+            async for message in channel.history(limit=None, oldest_first=False):
+                scanned+=1
+                for embed in message.embeds:
+                    header=" ".join(filter(None,[embed.title or "",embed.description or "",message.content or ""]))
+                    m=ticket_pattern.search(header)
+                    if not m:
+                        continue
+                    report_number=int(m.group(1))
+                    for field in embed.fields:
+                        fname=(field.name or "").strip().lower()
+                        if not any(h in fname for h in username_hints):
+                            continue
+                        value=str(field.value or "").replace("`","").replace("**","").strip()
+                        if not value:
+                            continue
+                        username=value.splitlines()[0].strip()
+                        await db.index_report_message(interaction.guild_id, report_number, username, channel.id, message.id, "discord_scan")
+                        indexed+=1
+                        break
+        except (discord.Forbidden, discord.HTTPException):
+            skipped+=1
+    await interaction.followup.send(
+        f"Index complete. **{indexed}** report message(s) indexed from **{scanned}** scanned messages. Skipped channels: **{skipped}**. `/track person` is now instant.",
+        ephemeral=True,
+    )
 
-    for index, chunk in enumerate(chunks, start=1):
-        embed = discord.Embed(
-            title=f"Existing Report Tickets • {username}" if index == 1 else f"More Report Tickets • {username}",
-            description="\n".join(chunk),
-            color=0x5865F2,
-        )
-        if index == 1:
-            embed.add_field(name="Tickets Found", value=str(len(records)), inline=True)
-            embed.add_field(name="Channels Scanned", value=str(scanned_channels), inline=True)
-            embed.add_field(name="Messages Scanned", value=f"{scanned_messages:,}", inline=True)
-            if skipped_channels:
-                embed.add_field(name="Unreadable Channels", value=str(skipped_channels), inline=True)
-            embed.set_footer(text="This result is scanned directly from Discord channel history, not the tracker database.")
-        await interaction.followup.send(embed=embed, ephemeral=True)
 
 @track.command(name="add-alias", description="Link another username spelling to an existing tracked player")
 @app_commands.describe(existing="Existing tracked username or Discord ID", alias="Another spelling/name that belongs to the same player")
@@ -2947,7 +2885,7 @@ async def help_command(interaction: discord.Interaction):
         "**`/report set-action report_id action`** — Records whether the submitted report resulted in Warn, Kick, Timeout, or Ban.\n\n"
         "**`/report update report_id status note`** — **Moderator**\n"
         "Changes a report to Open, In Review, Resolved, or Rejected and optionally saves a staff note.\n\n"
-        "**`/track person username`** — Scans all accessible Discord channels and lists matching existing Report Ticket # links for that player.\n\n"
+        "**`/track person username`** — Instantly lists indexed Report Ticket # links for that player. Run `/track index-existing` once to import older reports.\n\n"
         "**`/tracker player username`** — **Moderator**\n"
         "Shows the named player's warning total and report history. Names are matched without case sensitivity.\n\n"
         "**`/tracker user username`** — **Moderator**\n"
