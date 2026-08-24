@@ -904,6 +904,79 @@ class Database:
             )
             return await cur.fetchall()
 
+
+    async def rebuild_report_search_index_from_database(self, guild_id: int, reset: bool = False) -> tuple[int, int]:
+        """Rebuild the person tracker using only saved report/database records.
+
+        This never scans Discord channel history. It prefers the field slot whose tracker
+        role is `username`, then falls back to common username labels and finally
+        reports.target_name. Returns (indexed, skipped).
+        """
+        async with aiosqlite.connect(self.path) as conn:
+            conn.row_factory = aiosqlite.Row
+            if reset:
+                await conn.execute("DELETE FROM report_search_index WHERE guild_id=?", (guild_id,))
+
+            cur = await conn.execute(
+                "SELECT r.id,r.target_name,r.log_channel,r.log_message "
+                "FROM reports r WHERE r.guild_id=? AND r.status!='Deleted' ORDER BY r.id ASC",
+                (guild_id,),
+            )
+            reports = await cur.fetchall()
+            indexed = 0
+            skipped = 0
+            for report in reports:
+                username = None
+                # Best source: a dynamic form slot explicitly configured as the username tracker field.
+                cur2 = await conn.execute(
+                    "SELECT v.value FROM report_field_values v "
+                    "LEFT JOIN panel_form_slots s ON s.id=v.slot_id "
+                    "WHERE v.report_id=? AND LOWER(COALESCE(s.role,''))='username' "
+                    "ORDER BY v.position,v.id LIMIT 1",
+                    (report['id'],),
+                )
+                row = await cur2.fetchone()
+                if row and str(row[0] or '').strip() and str(row[0]).strip().lower() != 'not supplied':
+                    username = str(row[0]).strip()
+
+                # Compatibility for older forms that predate tracker roles.
+                if not username:
+                    cur2 = await conn.execute(
+                        "SELECT label,value FROM report_field_values WHERE report_id=? ORDER BY position,id",
+                        (report['id'],),
+                    )
+                    for fv in await cur2.fetchall():
+                        label = str(fv['label'] or '').strip().casefold()
+                        value = str(fv['value'] or '').strip()
+                        if not value or value.casefold() == 'not supplied':
+                            continue
+                        if ('username' in label or 'player name' in label or 'reported player' in label or label in {'player','target'}):
+                            username = value
+                            break
+
+                if not username:
+                    candidate = str(report['target_name'] or '').strip()
+                    if candidate and candidate.casefold() != 'not supplied':
+                        username = candidate
+
+                if not username or not report['log_channel'] or not report['log_message']:
+                    skipped += 1
+                    continue
+
+                normalized = self.normalize_identity(username)
+                if not normalized:
+                    skipped += 1
+                    continue
+                await conn.execute(
+                    "INSERT INTO report_search_index(guild_id,report_number,username_normalized,username_display,channel_id,message_id,source,updated_at) "
+                    "VALUES(?,?,?,?,?,?,?,CURRENT_TIMESTAMP) "
+                    "ON CONFLICT(guild_id,channel_id,message_id,username_normalized) DO UPDATE SET "
+                    "report_number=excluded.report_number,username_display=excluded.username_display,source=excluded.source,updated_at=CURRENT_TIMESTAMP",
+                    (guild_id, int(report['id']), normalized, username[:100], int(report['log_channel']), int(report['log_message']), 'database'),
+                )
+                indexed += 1
+            await conn.commit()
+            return indexed, skipped
     async def clear_report_search_index(self, guild_id: int) -> None:
         async with aiosqlite.connect(self.path) as conn:
             await conn.execute("DELETE FROM report_search_index WHERE guild_id=?", (guild_id,))
@@ -2734,7 +2807,7 @@ async def track_person(interaction: discord.Interaction, username: str):
     rows = await db.indexed_reports_for_person(interaction.guild_id, username)
     if not rows:
         return await interaction.response.send_message(
-            f"No indexed report tickets were found for **{username}**. Run `/track index-existing` once to import older Discord reports. Future reports are indexed automatically.",
+            f"No saved report tickets were found for **{username}**. Run `/track index-existing reset:True` once to rebuild the tracker directly from the existing report database. Future reports are indexed automatically.",
             ephemeral=True,
         )
     lines=[]
@@ -2753,47 +2826,14 @@ async def track_person(interaction: discord.Interaction, username: str):
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-@track.command(name="index-existing", description="Scan old Discord report messages once and build a fast tracker index")
-@app_commands.describe(reset="Clear the old index first and rebuild it")
+@track.command(name="index-existing", description="Build the tracker index instantly from saved report records")
+@app_commands.describe(reset="Clear the old tracker index before rebuilding")
 @app_commands.checks.has_permissions(administrator=True)
 async def track_index_existing(interaction: discord.Interaction, reset: bool = False):
     await interaction.response.defer(ephemeral=True, thinking=True)
-    guild=interaction.guild
-    if guild is None:
-        return await interaction.followup.send("This command can only be used in a server.", ephemeral=True)
-    if reset:
-        await db.clear_report_search_index(interaction.guild_id)
-    ticket_pattern = re.compile(r"(?:discord\s+report\s+ticket|game\s+report\s+ticket|report\s+ticket|ticket|report)\s*#\s*(\d+)", re.I)
-    username_hints=("username","roblox username","discord username","player","player name","reported player","reported username","target","user name")
-    scanned=0; indexed=0; skipped=0
-    for channel in guild.text_channels:
-        perms=channel.permissions_for(guild.me) if guild.me else None
-        if perms and (not perms.view_channel or not perms.read_message_history):
-            skipped+=1; continue
-        try:
-            async for message in channel.history(limit=None, oldest_first=False):
-                scanned+=1
-                for embed in message.embeds:
-                    header=" ".join(filter(None,[embed.title or "",embed.description or "",message.content or ""]))
-                    m=ticket_pattern.search(header)
-                    if not m:
-                        continue
-                    report_number=int(m.group(1))
-                    for field in embed.fields:
-                        fname=(field.name or "").strip().lower()
-                        if not any(h in fname for h in username_hints):
-                            continue
-                        value=str(field.value or "").replace("`","").replace("**","").strip()
-                        if not value:
-                            continue
-                        username=value.splitlines()[0].strip()
-                        await db.index_report_message(interaction.guild_id, report_number, username, channel.id, message.id, "discord_scan")
-                        indexed+=1
-                        break
-        except (discord.Forbidden, discord.HTTPException):
-            skipped+=1
+    indexed, skipped = await db.rebuild_report_search_index_from_database(interaction.guild_id, reset=reset)
     await interaction.followup.send(
-        f"Index complete. **{indexed}** report message(s) indexed from **{scanned}** scanned messages. Skipped channels: **{skipped}**. `/track person` is now instant.",
+        f"Tracker index ready. **{indexed}** existing report ticket(s) loaded directly from the database; **{skipped}** record(s) had no usable saved username/message link. No Discord channel history was scanned. `/track person` is now instant.",
         ephemeral=True,
     )
 
@@ -2885,7 +2925,7 @@ async def help_command(interaction: discord.Interaction):
         "**`/report set-action report_id action`** — Records whether the submitted report resulted in Warn, Kick, Timeout, or Ban.\n\n"
         "**`/report update report_id status note`** — **Moderator**\n"
         "Changes a report to Open, In Review, Resolved, or Rejected and optionally saves a staff note.\n\n"
-        "**`/track person username`** — Instantly lists indexed Report Ticket # links for that player. Run `/track index-existing` once to import older reports.\n\n"
+        "**`/track person username`** — Instantly lists saved Report Ticket # links for that player. `/track index-existing` rebuilds the search index directly from the report database; it does not scan channels.\n\n"
         "**`/tracker player username`** — **Moderator**\n"
         "Shows the named player's warning total and report history. Names are matched without case sensitivity.\n\n"
         "**`/tracker user username`** — **Moderator**\n"
