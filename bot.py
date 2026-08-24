@@ -1139,11 +1139,6 @@ class ReportModal(discord.ui.Modal):
                 await conn.execute("INSERT INTO evidence(report_id,filename,content_type,size,url) VALUES(?,?,?,?,?)", (report_id,uploaded.filename,original.content_type,uploaded.size,uploaded.url))
                 await conn.commit()
         await db.set_report_message(report_id, submission_channel.id, message.id)
-        try:
-            await archive_report_to_channel(interaction.guild, report_id)
-        except (discord.Forbidden, discord.HTTPException):
-            pass
-
         # Alert staff separately for Discord reports and Roblox game reports.
         reported_username = role_values["username"].strip()
         if reported_username and reported_username != "Not supplied":
@@ -1360,7 +1355,6 @@ class TicketControlsView(discord.ui.View):
         await send_ticket_action_notification(
             interaction.guild, panel, row, "Claimed", interaction.user, source_message=interaction.message
         )
-        await archive_event(interaction.guild, row["id"], f"✋ **Claimed** by {interaction.user.mention}.")
 
     @discord.ui.button(
         label="Deny Report", style=discord.ButtonStyle.secondary, emoji="⛔",
@@ -1443,7 +1437,6 @@ class DenyReportModal(discord.ui.Modal, title="Deny Report"):
         await send_ticket_action_notification(
             interaction.guild, panel, row, "Denied", interaction.user, reason=reason, source_message=message
         )
-        await archive_event(interaction.guild, self.report_id, f"⛔ **Denied** by {interaction.user.mention}.\n**Reason:** {reason}")
         await interaction.followup.send(f"Report **#{self.report_id}** was denied.", ephemeral=True)
 
 
@@ -1903,7 +1896,6 @@ setup = app_commands.Group(name="setup", description="Configure bot log channels
 report = app_commands.Group(name="report", description="Submit and manage reports")
 tracker = app_commands.Group(name="tracker", description="View moderation and report totals")
 track = app_commands.Group(name="track", description="View a person's complete moderation history")
-archive = app_commands.Group(name="archive", description="Compile and browse reports in one searchable archive channel")
 
 
 @setup.command(name="logs", description="Create or connect all private log channels")
@@ -2594,11 +2586,6 @@ async def report_panel(
 @app_commands.checks.has_permissions(moderate_members=True)
 async def report_set_action(interaction: discord.Interaction, report_id: int, action: app_commands.Choice[str]):
     ok = await db.set_report_action(interaction.guild_id, report_id, action.value)
-    if ok:
-        await archive_event(interaction.guild, report_id, f"🛡️ Moderation action recorded: **{action.value.title()}** by {interaction.user.mention}.")
-        row = await db.report(interaction.guild_id, report_id)
-        if row and row["player_id"]:
-            await refresh_archive_message(interaction.guild, report_id)
     await interaction.response.send_message(
         f"Report **#{report_id}** action set to **{action.name}**." if ok else "Report not found.",
         ephemeral=True,
@@ -2616,8 +2603,6 @@ async def report_view(interaction: discord.Interaction, report_id: int):
 @app_commands.checks.has_permissions(moderate_members=True)
 async def report_update(interaction: discord.Interaction, report_id: int, status: app_commands.Choice[str], note: str=""):
     ok=await db.update_report(interaction.guild_id,report_id,status.value,interaction.user.id,note)
-    if ok:
-        await archive_event(interaction.guild, report_id, f"📝 Status updated to **{status.value}** by {interaction.user.mention}." + (f"\n**Note:** {note}" if note else ""))
     await interaction.response.send_message(f"Report #{report_id} updated to **{status.value}**." if ok else "Report not found.",ephemeral=True)
 
 async def send_player_tracker(interaction: discord.Interaction, username: str):
@@ -2662,74 +2647,77 @@ async def tracker_summary(interaction: discord.Interaction):
 
 
 
-@track.command(name="person", description="Show a player's report actions, rules, and evidence")
-@app_commands.describe(username="Tracked username, known alias, or Discord ID")
+@track.command(name="person", description="Find report numbers saved for a player")
+@app_commands.describe(username="Player username, known alias, Roblox username, Discord username, or Discord ID")
 @app_commands.checks.has_permissions(moderate_members=True)
 async def track_person(interaction: discord.Interaction, username: str):
     await interaction.response.defer(ephemeral=True, thinking=True)
     profile, reports, evidence_map = await db.person_history(interaction.guild_id, username)
+    if not reports:
+        return await interaction.followup.send(
+            f"No saved reports were found for **{username}**. The search is case-insensitive and also checks saved aliases/IDs.",
+            ephemeral=True,
+        )
+
+    display_name = profile["canonical_name"] if profile else (reports[0]["target_name"] or username)
     case_totals = await db.case_totals_for_identity(interaction.guild_id, username)
-    report_actions = {"warn":0, "kick":0, "timeout":0, "ban":0}
+    report_actions = {"warn": 0, "kick": 0, "timeout": 0, "ban": 0}
     for row in reports:
         action = (row["action_taken"] or "").lower()
         if action in report_actions:
             report_actions[action] += 1
     totals = {k: case_totals.get(k, 0) + report_actions[k] for k in report_actions}
-    display_name = profile["canonical_name"] if profile else username
-    embed = discord.Embed(title=f"Person Tracker • {display_name}", color=0x5865F2)
-    embed.add_field(name="Username", value=display_name, inline=False)
-    if profile and profile["discord_id"]:
-        embed.add_field(name="Discord ID", value=profile["discord_id"], inline=False)
-    embed.add_field(name="Warn Count", value=str(totals["warn"]))
-    embed.add_field(name="Kick Count", value=str(totals["kick"]))
-    embed.add_field(name="Ban Count", value=str(totals["ban"]))
-    embed.add_field(name="Timeout Count", value=str(totals["timeout"]))
-    embed.add_field(name="Total Reports", value=str(len(reports)))
-    rules=[]
-    seen=set()
+
+    embed = discord.Embed(
+        title=f"Report Numbers • {display_name}",
+        description=f"Found **{len(reports)}** saved report(s) for this player.",
+        color=0x5865F2,
+    )
+    if totals["warn"] >= 2:
+        embed.description += f"\n⚠️ **{totals['warn']} recorded warnings.**"
+
+    lines = []
     for row in reports:
-        rule=(row["category"] or "Not supplied").strip()
-        key=rule.casefold()
-        if key not in seen:
-            seen.add(key); rules.append(rule)
-    embed.add_field(
-        name="Rules Broken",
-        value=("\n".join(f"• {r}" for r in rules[:10]) or "None recorded")[:1024],
-        inline=False,
-    )
-    history = []
-    for row in reports[:10]:
-        action = (row["action_taken"] or "Pending / not assigned").replace("_", " ").title()
-        ev = evidence_map.get(row["id"], [])
-        ev_links = " ".join(
-            f"[Evidence {i + 1}]({item['url']})" for i, item in enumerate(ev[:3])
-        ) or "No evidence"
-        jump = ""
+        action = (row["action_taken"] or "Pending").replace("_", " ").title()
+        status = row["status"] or "Open"
+        jump = None
         if row["log_channel"] and row["log_message"]:
-            jump = (
-                f"https://discord.com/channels/{interaction.guild_id}/"
-                f"{row['log_channel']}/{row['log_message']}"
-            )
-        report_link = f"[Report #{row['id']}]({jump})" if jump else f"Report #{row['id']}"
-        source_channel = interaction.guild.get_channel(row["log_channel"]) if row["log_channel"] else None
-        if isinstance(source_channel, discord.TextChannel):
-            category_name = source_channel.category.name if source_channel.category else "No category"
-            source_text = f"{source_channel.mention} • {category_name}"
+            jump = f"https://discord.com/channels/{interaction.guild_id}/{row['log_channel']}/{row['log_message']}"
+        if jump:
+            lines.append(f"• [Report #{row['id']}]({jump}) — **{action}** • {status}")
         else:
-            source_text = "Saved database record (source channel unavailable)"
-        history.append(
-            f"**{report_link} — {action}**\n"
-            f"Rule: {(row['category'] or 'Not supplied')[:180]}\n"
-            f"Source: {source_text}\n"
-            f"{ev_links}"
-        )
-    embed.add_field(
-        name="Recent Reports & Evidence",
-        value=("\n\n".join(history) or "No matching reports found.")[:1024],
-        inline=False,
-    )
-    embed.set_footer(text="Database-first tracker: every submission is linked to one player profile regardless of panel, channel, category, deleted message, or renamed channel. Use /report set-action after staff decides the action.")
-    await interaction.followup.send(embed=embed, ephemeral=True)
+            lines.append(f"• **Report #{row['id']}** — **{action}** • {status}")
+
+    # Keep each embed description safely below Discord's 4096-character limit.
+    chunks = []
+    current = []
+    current_len = 0
+    for line in lines:
+        if current and current_len + len(line) + 1 > 3500:
+            chunks.append(current)
+            current = []
+            current_len = 0
+        current.append(line)
+        current_len += len(line) + 1
+    if current:
+        chunks.append(current)
+
+    first = True
+    for index, chunk in enumerate(chunks, start=1):
+        if first:
+            embed.add_field(name="Existing Reports", value="\n".join(chunk)[:1024] if len("\n".join(chunk)) <= 1024 else "See continuation below.", inline=False)
+            if len("\n".join(chunk)) > 1024:
+                embed.description += "\n\n" + "\n".join(chunk)
+            embed.set_footer(text="Click a Report # to jump to the original Discord submission when the message still exists.")
+            await interaction.followup.send(embed=embed, ephemeral=True)
+            first = False
+        else:
+            extra = discord.Embed(
+                title=f"More Report Numbers • {display_name} ({index}/{len(chunks)})",
+                description="\n".join(chunk),
+                color=0x2B2D31,
+            )
+            await interaction.followup.send(embed=extra, ephemeral=True)
 
 @track.command(name="add-alias", description="Link another username spelling to an existing tracked player")
 @app_commands.describe(existing="Existing tracked username or Discord ID", alias="Another spelling/name that belongs to the same player")
@@ -2740,142 +2728,6 @@ async def track_add_alias(interaction: discord.Interaction, existing: str, alias
         f"Linked **{alias}** to **{existing}**." if ok else "Existing player was not found. Submit at least one report for that player first.",
         ephemeral=True,
     )
-
-@archive.command(name="setup", description="Choose one channel where old and future reports are compiled")
-@app_commands.describe(channel="Staff archive channel", auto_archive="Automatically copy every future report into this archive")
-@app_commands.checks.has_permissions(administrator=True)
-async def archive_setup(interaction: discord.Interaction, channel: discord.TextChannel, auto_archive: bool = True):
-    legacy = await db.clear_legacy_thread_links(interaction.guild_id)
-    await db.update_settings(
-        interaction.guild_id,
-        report_archive_channel=channel.id,
-        report_threads_enabled=int(auto_archive),
-    )
-    await interaction.response.send_message(
-        f"Compiled report archive set to {channel.mention}.\n"
-        f"Automatic future report compilation: **{'ON' if auto_archive else 'OFF'}**.\n"
-        + (f"Cleared **{legacy}** old thread mapping(s). " if legacy else "")
-        + "Run `/archive compile-existing` to copy older saved reports into this channel.",
-        ephemeral=True,
-    )
-
-
-@archive.command(name="compile-existing", description="Copy older saved reports into the archive channel")
-@app_commands.describe(limit="Maximum reports to compile in this batch (1-100)")
-@app_commands.checks.has_permissions(administrator=True)
-async def archive_compile_existing(interaction: discord.Interaction, limit: app_commands.Range[int, 1, 100] = 50):
-    await interaction.response.defer(ephemeral=True, thinking=True)
-    settings = await db.settings(interaction.guild_id)
-    channel = interaction.guild.get_channel(settings["report_archive_channel"] or 0)
-    if not isinstance(channel, discord.TextChannel):
-        return await interaction.followup.send("Run `/archive setup` first and choose a valid archive channel.", ephemeral=True)
-
-    # Old thread-based versions stored thread IDs. Clear only those legacy mappings.
-    await db.clear_legacy_thread_links(interaction.guild_id)
-    ids = await db.unarchived_reports(interaction.guild_id, limit)
-    if not ids:
-        return await interaction.followup.send(
-            f"All saved reports are already compiled in {channel.mention}. Use `/archive two-warnings` to instantly find players with 2+ warnings.",
-            ephemeral=True,
-        )
-
-    compiled = failed = 0
-    for report_id in ids:
-        try:
-            if await archive_report_to_channel(interaction.guild, report_id, force=True):
-                compiled += 1
-            else:
-                failed += 1
-        except (discord.Forbidden, discord.HTTPException):
-            failed += 1
-        await asyncio.sleep(0.2)
-    total, archived = await db.archive_counts(interaction.guild_id)
-    remaining = max(0, total - archived)
-    await interaction.followup.send(
-        f"Compiled **{compiled}** old report(s) into {channel.mention}. Failed: **{failed}**. Remaining: **{remaining}**."
-        + (" Run `/archive compile-existing` again to continue." if remaining else " Archive is up to date."),
-        ephemeral=True,
-    )
-
-
-@archive.command(name="rebuild", description="Repair missing compiled report messages without using threads")
-@app_commands.describe(limit="Maximum reports to verify/rebuild (1-100)")
-@app_commands.checks.has_permissions(administrator=True)
-async def archive_rebuild(interaction: discord.Interaction, limit: app_commands.Range[int, 1, 100] = 100):
-    await interaction.response.defer(ephemeral=True, thinking=True)
-    settings = await db.settings(interaction.guild_id)
-    channel = interaction.guild.get_channel(settings["report_archive_channel"] or 0)
-    if not isinstance(channel, discord.TextChannel):
-        return await interaction.followup.send("Run `/archive setup` first.", ephemeral=True)
-    ids = await db.all_report_ids(interaction.guild_id, limit)
-    repaired = valid = failed = 0
-    for report_id in ids:
-        report, _, _ = await db.archive_report_data(interaction.guild_id, report_id)
-        if not report:
-            continue
-        msg_id = report["archive_index_message"]
-        if msg_id:
-            try:
-                await channel.fetch_message(int(msg_id))
-                valid += 1
-                continue
-            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-                await db.clear_archive_message(interaction.guild_id, report_id)
-        try:
-            if await archive_report_to_channel(interaction.guild, report_id, force=True):
-                repaired += 1
-            else:
-                failed += 1
-        except (discord.Forbidden, discord.HTTPException):
-            failed += 1
-        await asyncio.sleep(0.2)
-    await interaction.followup.send(
-        f"Archive check complete in {channel.mention}. Valid: **{valid}** • Rebuilt: **{repaired}** • Failed: **{failed}**.",
-        ephemeral=True,
-    )
-
-
-@archive.command(name="status", description="Show compiled report archive status")
-@app_commands.checks.has_permissions(moderate_members=True)
-async def archive_status(interaction: discord.Interaction):
-    settings = await db.settings(interaction.guild_id)
-    channel = interaction.guild.get_channel(settings["report_archive_channel"] or 0)
-    total, archived = await db.archive_counts(interaction.guild_id)
-    await interaction.response.send_message(
-        f"**Archive channel:** {channel.mention if isinstance(channel, discord.TextChannel) else 'Not configured'}\n"
-        f"**Automatic future compilation:** {'ON' if settings['report_threads_enabled'] else 'OFF'}\n"
-        f"**Compiled reports:** {archived}/{total}\n"
-        f"**Remaining:** {max(0, total-archived)}",
-        ephemeral=True,
-    )
-
-
-@archive.command(name="two-warnings", description="Quickly list every tracked player with two or more warnings")
-@app_commands.checks.has_permissions(moderate_members=True)
-async def archive_two_warnings(interaction: discord.Interaction):
-    rows = await db.players_with_two_warns(interaction.guild_id)
-    if not rows:
-        return await interaction.response.send_message("No tracked player currently has two or more warning actions.", ephemeral=True)
-    settings = await db.settings(interaction.guild_id)
-    channel = interaction.guild.get_channel(settings["report_archive_channel"] or 0)
-    lines = []
-    for row in rows[:25]:
-        jump = "Archive entry not compiled yet"
-        if isinstance(channel, discord.TextChannel) and row["latest_archive_message"]:
-            jump_url = f"https://discord.com/channels/{interaction.guild_id}/{channel.id}/{row['latest_archive_message']}"
-            jump = f"[Open latest archived report]({jump_url})"
-        lines.append(
-            f"⚠️ **{row['canonical_name']}** — **{int(row['warns'] or 0)} warns** • "
-            f"{int(row['total'] or 0)} reports • {jump}"
-        )
-    embed = discord.Embed(
-        title="⚠️ Players With 2+ Warnings",
-        description="\n".join(lines),
-        color=0xE74C3C,
-    )
-    embed.set_footer(text="Use /track person <username> for the complete rules, actions, and evidence history.")
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-
 
 @bot.tree.command(name="help", description="Show explanations and examples for every bot command")
 async def help_command(interaction: discord.Interaction):
@@ -2954,19 +2806,13 @@ async def help_command(interaction: discord.Interaction):
         "**`/report set-action report_id action`** — Records whether the submitted report resulted in Warn, Kick, Timeout, or Ban.\n\n"
         "**`/report update report_id status note`** — **Moderator**\n"
         "Changes a report to Open, In Review, Resolved, or Rejected and optionally saves a staff note.\n\n"
-        "**`/track person username`** — Shows rules broken, Warn/Kick/Ban/Timeout counts, and evidence links.\n\n"
+        "**`/track person username`** — Lists every existing Report # saved for that player, with status/action and an original-report link when available.\n\n"
         "**`/tracker player username`** — **Moderator**\n"
         "Shows the named player's warning total and report history. Names are matched without case sensitivity.\n\n"
         "**`/tracker user username`** — **Moderator**\n"
         "Alias of `/tracker player`.\n\n"
         "**`/tracker summary`** — **Moderator**\n"
         "Shows server-wide totals for warnings and report statuses.\n\n"
-        "**`/archive setup channel auto_archive`** — **Administrator**\n"
-        "Chooses one staff archive channel and automatically copies every future report there.\n\n"
-        "**`/archive compile-existing limit`** — **Administrator**\n"
-        "Copies older database reports into the same archive channel in batches of up to 100.\n\n"
-        "**`/archive status`** — **Moderator**\n"
-        "Shows how many reports have already been compiled into the archive channel."
     )
     tracking_embed.set_footer(text="Tip: use the same spelling for player names to keep tracker records together.")
 
@@ -2976,7 +2822,6 @@ async def help_command(interaction: discord.Interaction):
 
 bot.tree.add_command(setup); bot.tree.add_command(report); bot.tree.add_command(tracker)
 bot.tree.add_command(track)
-bot.tree.add_command(archive)
 
 @bot.tree.error
 async def tree_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
