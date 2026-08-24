@@ -1851,7 +1851,7 @@ class FormSlotManagerView(discord.ui.View):
         slot = self.slots.get(self.selected_slot_id)
         if not slot:
             return await interaction.response.send_message("That field is no longer available. Reopen the manager.", ephemeral=True)
-        await interaction.response.defer(ephemeral=True)
+        await interaction.response.defer(ephemeral=False)
         await db.delete_form_slot(self.panel_id, self.selected_slot_id)
         self.slots.pop(self.selected_slot_id, None)
         await interaction.followup.send(
@@ -1887,7 +1887,7 @@ class FormEditorView(discord.ui.View):
 
     @discord.ui.button(label="Manage Fields", style=discord.ButtonStyle.primary, emoji="🧩")
     async def fields_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.defer(ephemeral=True)
+        await interaction.response.defer(ephemeral=False)
         panel = await db.panel(interaction.guild_id, self.panel_id)
         if not panel:
             return await interaction.followup.send("Panel no longer exists.", ephemeral=True)
